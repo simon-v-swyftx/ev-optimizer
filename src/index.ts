@@ -1,0 +1,408 @@
+import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
+import { FoxEssClient } from "./clients/foxess";
+import { TessieClient } from "./clients/tessie";
+import { excludedSlots, haversineM } from "./charges";
+import {
+  DEFAULT_SAFETY_FACTOR,
+  DEFAULT_STRANDED_MIN_PCT,
+  HOME_RADIUS_M,
+  LOAD_LOOKBACK_DAYS,
+  TICK_END_MINS,
+  TICK_START_MINS,
+  TZ_OFFSET_MS,
+} from "./constants";
+
+export interface Env {
+  DB: D1Database;
+  TESSIE_TOKEN: string;
+  TESSIE_VIN: string;
+  FOXESS_API_KEY: string;
+  FOXESS_DEVICE_SN: string;
+  NTFY_TOPIC: string;
+  ADMIN_KEY: string; // bearer for admin HTTP routes (/backfill, step-3 endpoints)
+}
+
+// Local time is a fixed UTC offset, no DST (invariant 5). Do not add
+// timezone libraries.
+export function brisbaneNow(now = new Date()): Date {
+  return new Date(now.getTime() + TZ_OFFSET_MS);
+}
+
+function withinOperatingWindow(local: Date): boolean {
+  const mins = local.getUTCHours() * 60 + local.getUTCMinutes();
+  return mins >= TICK_START_MINS && mins <= TICK_END_MINS;
+}
+
+const NIGHTLY_CRON = "0 15 * * *"; // 01:00 Brisbane
+
+export default {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    const local = brisbaneNow();
+    const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
+    const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
+
+    if (event.cron === NIGHTLY_CRON) {
+      ctx.waitUntil(
+        pullYesterdayLoad(env, foxess, tessie, local).catch(async (err) => {
+          console.error("nightly load pull failed", err); // survives even if ntfy is down
+          await notify(env, `nightly load pull failed: ${err instanceof Error ? err.message : String(err)}`);
+        }),
+      );
+      return;
+    }
+
+    if (!withinOperatingWindow(local)) return;
+
+    ctx.waitUntil(
+      runTick(env, foxess, tessie, local).catch(async (err) => {
+        console.error("tick failed", err); // survives even if ntfy is down
+        await notify(env, `tick failed: ${err instanceof Error ? err.message : String(err)}`);
+      }),
+    );
+  },
+
+  // Manual controls + status for the dashboard. TODO: implement rest at step 3.
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+
+    // Seed load_samples from FoxESS history for a past date range.
+    if (url.pathname === "/backfill" && req.method === "POST") {
+      if (req.headers.get("authorization") !== `Bearer ${env.ADMIN_KEY}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const from = url.searchParams.get("from") ?? "";
+      const to = url.searchParams.get("to") ?? "";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || from > to) {
+        return new Response("need ?from=YYYY-MM-DD&to=YYYY-MM-DD", { status: 400 });
+      }
+      // ponytail: 21-day cap keeps one request under the 50-subrequest limit;
+      // call again for older ranges.
+      if ((Date.parse(to) - Date.parse(from)) / 86_400_000 >= 21) {
+        return new Response("max 21 days per call", { status: 400 });
+      }
+      const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
+      const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
+      // One charges call for the whole range (padded a day each side for
+      // midnight-spanning sessions) keeps the request under subrequest limits.
+      const home = await homeCoords(env);
+      const fromMs = Date.parse(`${from}T00:00:00+10:00`);
+      const toMs = Date.parse(`${to}T00:00:00+10:00`);
+      const charges = await tessie.getCharges((fromMs - 86_400_000) / 1000, (toMs + 2 * 86_400_000) / 1000);
+      const ok: string[] = [];
+      const failed: Record<string, string> = {};
+      for (let d = from; d <= to; d = nextDay(d)) {
+        try {
+          await pullDayLoad(env, foxess, d, excludedSlots(charges, home, d, Date.now()));
+          ok.push(d);
+        } catch (err) {
+          failed[d] = err instanceof Error ? err.message : String(err);
+        }
+        await new Promise((r) => setTimeout(r, 1100)); // FoxESS queries <= 1/s
+      }
+      return Response.json({ ok, failed });
+    }
+
+    // Manual car controls. A /car/start here is an OWNER action: the next
+    // tick sees a charge the system didn't start and backs off (invariant 6).
+    if ((url.pathname === "/car/start" || url.pathname === "/car/stop") && req.method === "POST") {
+      if (req.headers.get("authorization") !== `Bearer ${env.ADMIN_KEY}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
+      const action = url.pathname === "/car/start" ? "manual_api_start" : "manual_api_stop";
+      if (url.pathname === "/car/start") await tessie.startCharging();
+      else await tessie.stopCharging();
+      await env.DB.prepare(
+        "INSERT INTO decisions (ts, state_from, state_to, action, inputs_json) VALUES (?,?,?,?,?)",
+      )
+        .bind(new Date().toISOString(), "MANUAL", "MANUAL", action, "{}")
+        .run();
+      return Response.json({ ok: true, action });
+    }
+
+    // Raw FoxESS real/query dump (all variables, full envelope) for
+    // diagnosing read failures like "real-time missing SoC".
+    if (url.pathname === "/debug/foxess") {
+      if (req.headers.get("authorization") !== `Bearer ${env.ADMIN_KEY}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
+      try {
+        return Response.json(await foxess.rawRealTime());
+      } catch (err) {
+        return new Response(err instanceof Error ? err.message : String(err), { status: 502 });
+      }
+    }
+
+    if (url.pathname === "/status") {
+      if (req.headers.get("authorization") !== `Bearer ${env.ADMIN_KEY}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const [day, decisions] = await Promise.all([
+        env.DB.prepare("SELECT * FROM days ORDER BY date DESC LIMIT 1").first(),
+        env.DB.prepare("SELECT ts, state_from, state_to, action FROM decisions ORDER BY id DESC LIMIT 20").all(),
+      ]);
+      return Response.json({ day, decisions: decisions.results });
+    }
+
+    return new Response("ev-optimiser", { status: 200 });
+  },
+} satisfies ExportedHandler<Env>;
+
+/** One 5-min tick: read car + house, run the pure decision, execute (unless
+ *  shadow mode), persist state + decision log. */
+export async function runTick(
+  env: Env,
+  foxess: FoxEssClient,
+  tessie: TessieClient,
+  local: Date,
+): Promise<void> {
+  const date = local.toISOString().slice(0, 10);
+  const nowMins = local.getUTCHours() * 60 + local.getUTCMinutes();
+
+  const cfgRows = await d1Retry(() =>
+    env.DB.prepare("SELECT key, value FROM config").all<{ key: string; value: string }>(),
+  );
+  const cfg = new Map(cfgRows.results.map((r) => [r.key, r.value]));
+  const home = { lat: Number(cfg.get("home_lat")), lon: Number(cfg.get("home_lon")) };
+  if (Number.isNaN(home.lat) || Number.isNaN(home.lon)) throw new Error("config home_lat/home_lon missing");
+  const shadowMode = cfg.get("shadow_mode") !== "false"; // default ON: act only when explicitly enabled
+
+  let car: Awaited<ReturnType<TessieClient["getCarState"]>>;
+  let house: Awaited<ReturnType<FoxEssClient["getRealTime"]>>;
+  try {
+    [car, house] = await Promise.all([tessie.getCarState(), foxess.getRealTime()]);
+  } catch (err) {
+    await recordReadFailure(env, err);
+    return; // state untouched; floor + car limit are the hardware backstops
+  }
+
+  const dayRow = await d1Retry(() =>
+    env.DB.prepare("SELECT state_json FROM days WHERE date = ?")
+      .bind(date)
+      .first<{ state_json: string | null }>(),
+  );
+  const stored: StoredState | null = dayRow?.state_json ? (JSON.parse(dayRow.state_json) as StoredState) : null;
+  const samples = stored
+    ? []
+    : (
+        await d1Retry(() =>
+          env.DB.prepare(
+            "SELECT slot_half_hour AS slot, load_kwh AS loadKwh FROM load_samples WHERE date >= ? AND date < ?",
+          )
+            .bind(addDays(date, -LOAD_LOOKBACK_DAYS), date)
+            .all<{ slot: number; loadKwh: number }>(),
+        )
+      ).results;
+
+  const atHome =
+    car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= HOME_RADIUS_M;
+
+  const inputs: DecideInputs = {
+    date,
+    nowMins,
+    car: {
+      pluggedIn: car.pluggedIn,
+      chargingState: car.chargingState,
+      socPct: car.socPct,
+      limitPct: car.limitPct,
+      chargeAmps: car.chargeAmps,
+      atHome,
+    },
+    house,
+    cfg: {
+      safetyFactor: Number(cfg.get("safety_factor") ?? DEFAULT_SAFETY_FACTOR),
+      strandedMinPct: Number(cfg.get("stranded_min_pct") ?? DEFAULT_STRANDED_MIN_PCT),
+      solarTrack: cfg.get("solar_track") !== "false",
+      shadowMode,
+    },
+    samples,
+    stored,
+  };
+  const { actions, next } = decide(inputs);
+
+  if (!shadowMode) {
+    for (const act of actions) {
+      if (act.kind === "start_charging") {
+        await tessie.startCharging();
+        await tessie.setChargingAmps(act.amps);
+      } else if (act.kind === "stop_charging") {
+        await tessie.stopCharging();
+      } else if (act.kind === "set_amps") {
+        await tessie.setChargingAmps(act.amps);
+      } else {
+        await notify(env, act.message);
+      }
+    }
+  }
+
+  const stateChanged = !stored || stored.state !== next.state;
+  if (actions.length || stateChanged) {
+    const prefix = shadowMode && actions.length ? "shadow: " : "";
+    await d1Retry(() =>
+      env.DB.prepare("INSERT INTO decisions (ts, state_from, state_to, action, inputs_json) VALUES (?,?,?,?,?)")
+        .bind(
+          new Date().toISOString(),
+          stored?.state ?? "PLAN",
+          next.state,
+          prefix + (actions.length ? actions.map(describeAction).join(" | ") : "none"),
+          JSON.stringify({ nowMins, car: inputs.car, house, cfg: inputs.cfg, before: stored, after: next }),
+        )
+        .run(),
+    );
+  }
+  await d1Retry(() =>
+    env.DB.prepare(
+      "INSERT INTO days (date, reserve_pct, planned_at, state, state_json) VALUES (?,?,?,?,?) " +
+        "ON CONFLICT(date) DO UPDATE SET state = excluded.state, state_json = excluded.state_json",
+    )
+      .bind(date, next.reservePct, new Date().toISOString(), next.state, JSON.stringify(next))
+      .run(),
+  );
+
+  // PLAN-time read-only hardware-floor verification (alert on drift).
+  if (!stored) {
+    try {
+      const floor = await foxess.getMinSocOnGrid();
+      if (floor < next.reservePct && !shadowMode) {
+        await notify(
+          env,
+          `FoxESS minSocOnGrid ${floor}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
+        );
+      }
+    } catch (err) {
+      if (!shadowMode) {
+        await notify(env, `reserve floor verify failed: ${err instanceof Error ? err.message : String(err)}`);
+      } else {
+        console.error("floor verify failed (shadow)", err);
+      }
+    }
+  }
+}
+
+function describeAction(a: Action): string {
+  if (a.kind === "start_charging" || a.kind === "set_amps") return `${a.kind}:${a.amps}`;
+  if (a.kind === "stop_charging") return `stop_charging:${a.reason}`;
+  return `notify:${a.message}`;
+}
+
+/** Read failures must not spam: log every one, ntfy at most every 3 h.
+ *  Throttle on the last ALERTED failure ('read_failure_alert' rows), not the
+ *  last failure — during a continuous outage a row lands every 5 min, which
+ *  must never reset the 3 h window (that silenced the 2026-07-06 outage). */
+async function recordReadFailure(env: Env, err: unknown): Promise<void> {
+  const msg = err instanceof Error ? err.message : String(err);
+  const last = await d1Retry(() =>
+    env.DB.prepare(
+      "SELECT ts FROM decisions WHERE action = 'read_failure_alert' ORDER BY id DESC LIMIT 1",
+    ).first<{ ts: string }>(),
+  );
+  const alert = !last || Date.now() - Date.parse(last.ts) > 3 * 3600 * 1000;
+  await d1Retry(() =>
+    env.DB.prepare("INSERT INTO decisions (ts, state_from, state_to, action, inputs_json) VALUES (?,?,?,?,?)")
+      .bind(
+        new Date().toISOString(),
+        "-",
+        "-",
+        alert ? "read_failure_alert" : "read_failure",
+        JSON.stringify({ error: msg }),
+      )
+      .run(),
+  );
+  if (alert) {
+    await notify(env, `tick read failure (alerts throttled to one / 3 h): ${msg}`);
+  }
+}
+
+/** Pull yesterday's (Brisbane) load history into load_samples, dropping
+ *  slots that overlap a home charging session (Tessie charge history sees
+ *  ALL charges, including outside the tick window — the sessions table
+ *  cannot). Fails loud: a day with unfilterable EV load must not enter the
+ *  forecast. */
+export async function pullYesterdayLoad(
+  env: Env,
+  foxess: FoxEssClient,
+  tessie: TessieClient,
+  local: Date,
+): Promise<void> {
+  const date = new Date(local.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const home = await homeCoords(env);
+  const dayMs = Date.parse(`${date}T00:00:00+10:00`);
+  const charges = await tessie.getCharges((dayMs - 86_400_000) / 1000, (dayMs + 2 * 86_400_000) / 1000);
+  await pullDayLoad(env, foxess, date, excludedSlots(charges, home, date, Date.now()));
+}
+
+/** Pull one Brisbane day (YYYY-MM-DD) of load history into load_samples. */
+export async function pullDayLoad(
+  env: Env,
+  foxess: FoxEssClient,
+  date: string,
+  exclude: Set<number>,
+): Promise<void> {
+  const rows = await foxess.pullDailyLoadHistory(date);
+  if (rows.length === 0) throw new Error(`no load samples returned for ${date}`);
+  const kept = rows.filter((r) => !exclude.has(r.slot));
+  const stmt = env.DB.prepare(
+    "INSERT INTO load_samples (date, slot_half_hour, load_kwh) VALUES (?, ?, ?)",
+  );
+  // Delete-then-insert in one atomic batch so a re-pull also REMOVES slots
+  // now excluded (INSERT OR REPLACE alone would leave stale contaminated rows).
+  await d1Retry(() =>
+    env.DB.batch([
+      env.DB.prepare("DELETE FROM load_samples WHERE date = ?").bind(date),
+      ...kept.map((r) => stmt.bind(date, r.slot, r.loadKwh)),
+    ]),
+  );
+}
+
+async function homeCoords(env: Env): Promise<{ lat: number; lon: number }> {
+  const { results } = await d1Retry(() =>
+    env.DB.prepare(
+      "SELECT key, value FROM config WHERE key IN ('home_lat','home_lon')",
+    ).all<{ key: string; value: string }>(),
+  );
+  const map = new Map(results.map((r) => [r.key, Number(r.value)]));
+  const lat = map.get("home_lat");
+  const lon = map.get("home_lon");
+  if (lat === undefined || lon === undefined || Number.isNaN(lat) || Number.isNaN(lon)) {
+    throw new Error("config home_lat/home_lon missing (seed per SPEC 'Owner operating facts')");
+  }
+  return { lat, lon };
+}
+
+function nextDay(date: string): string {
+  return addDays(date, 1);
+}
+
+function addDays(date: string, n: number): string {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** D1 throws transient "overloaded"/reset errors under Cloudflare-side load
+ *  (worst at :00/:30, when the world's crons fire — the DB itself is tiny).
+ *  Retry before letting the tick fail: a lost tick is benign (the next one
+ *  redoes everything) but its "tick failed" alert is pure noise.
+ *  ponytail: a SUSTAINED D1 outage still alerts once per 5-min tick; add
+ *  KV-backed alert throttling only if that ever actually happens. */
+export async function d1Retry<T>(fn: () => Promise<T>, delaysMs = [0, 500, 1500]): Promise<T> {
+  let lastErr: unknown;
+  for (const wait of delaysMs) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    try {
+      return await fn();
+    } catch (err) {
+      if (!/overloaded|queued for too long|network connection lost|internal error|reset/i.test(String(err))) {
+        throw err;
+      }
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+export async function notify(env: Env, message: string): Promise<void> {
+  const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, { method: "POST", body: message });
+  // Fail loud: a swallowed 4xx/5xx here would make every failure path in the
+  // worker look successful with zero trace (invariant 2 in CLAUDE.md).
+  if (!res.ok) throw new Error(`ntfy ${res.status}: ${message}`);
+}

@@ -1,0 +1,19 @@
+{
+  "name": "ev-optimiser",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "triggers": {
+    // 15:00 UTC = 01:00 Brisbane: nightly pull of yesterday's load history.
+    // */5: the tick state machine, gated in code to 05:30-14:15 Brisbane.
+    // Shadow mode (config.shadow_mode, default true) logs decisions without
+    // sending car commands; flip to 'false' after the shadow week.
+    "crons": ["0 15 * * *", "*/5 * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ev_optimiser",
+      "database_id": "cdfdf939-7150-4226-a266-ee9f36bc5981"
+    }
+  ]
+}
