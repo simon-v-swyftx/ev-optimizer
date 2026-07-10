@@ -11,6 +11,7 @@ function base(): DecideInputs {
     house: { socPct: 44, loadW: 400, gridImportW: 0, pvW: 0, feedinW: 0 },
     cfg: { safetyFactor: 1.3, strandedMinPct: 30, solarTrack: true, shadowMode: false },
     samples: [],
+    floorPct: 10,
     stored: null,
   };
 }
@@ -57,6 +58,27 @@ describe("PLAN (first tick of day)", () => {
     const { next } = decide(i);
     expect(next.date).toBe("2026-07-06");
     expect(next.solarResumes).toBe(0);
+  });
+
+  it("adopts an owner-raised minSocOnGrid above the forecast as the effective reserve", () => {
+    const i = base();
+    i.floorPct = 35; // owner raised it in the FoxESS app; forecast says 26
+    const { next } = decide(i);
+    expect(next.reservePct).toBe(35);
+  });
+
+  it("keeps the forecast reserve when the floor is at the 10% BMS minimum", () => {
+    const i = base();
+    i.floorPct = 10; // manufacturer minimum, below the 26% forecast
+    const { next } = decide(i);
+    expect(next.reservePct).toBe(26);
+  });
+
+  it("falls back to the forecast reserve when the floor read failed (null)", () => {
+    const i = base();
+    i.floorPct = null;
+    const { next } = decide(i);
+    expect(next.reservePct).toBe(26);
   });
 });
 

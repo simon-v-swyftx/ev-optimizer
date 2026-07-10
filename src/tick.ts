@@ -76,6 +76,14 @@ export interface DecideInputs {
   };
   /** Half-hour load history for PLAN; only read on the first tick of a day. */
   samples: { slot: number; loadKwh: number }[];
+  /** FoxESS minSocOnGrid, read (read-only) at PLAN. 10% is the manufacturer
+   *  BMS minimum; the owner may raise it in the FoxESS app, and an owner-set
+   *  floor above the forecast reserve becomes the day's effective reserve —
+   *  so the software stops dumping AT the hardware floor instead of planning
+   *  through it (the inverter would stop discharging and the shortfall would
+   *  be paid grid import). null = read failed or not the first tick of a day;
+   *  falls back to the forecast reserve (hardware still enforces the floor). */
+  floorPct: number | null;
   stored: StoredState | null;
 }
 
@@ -95,12 +103,17 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       : {
           date: i.date,
           state: "IDLE",
-          reservePct: reservePct({
-            nowSlot: Math.floor(i.nowMins / 30),
-            samples: i.samples,
-            safetyFactor: i.cfg.safetyFactor,
-            batteryKwh: BATTERY_KWH,
-          }),
+          // Owner-raised hardware floor wins over the forecast (see
+          // DecideInputs.floorPct); the drift alert covers the other drift.
+          reservePct: Math.max(
+            reservePct({
+              nowSlot: Math.floor(i.nowMins / 30),
+              samples: i.samples,
+              safetyFactor: i.cfg.safetyFactor,
+              batteryKwh: BATTERY_KWH,
+            }),
+            i.floorPct ?? 0,
+          ),
           sessionOwner: null,
           startPending: -1,
           startBlocked: false,

@@ -75,7 +75,19 @@ PLAN (first tick of day, ~05:30)
   software-side dump cutoff, and VERIFIES the configured hardware floor
   (alert on drift). Revert to daily writes only if the computed reserve
   varies by more than a few points day-to-day.
-  Fallback: if FoxESS unreachable at PLAN, use the last known reserve; alert.
+  Owner-raised floor (2026-07-10): 10% is the manufacturer BMS minimum; the
+  owner may set minSocOnGrid HIGHER in the FoxESS app, and the software must
+  respect that. PLAN reads minSocOnGrid (the same read the verify uses) and
+  the day's effective reserve is max(forecast reserve_pct, minSocOnGrid) —
+  so DUMPING stops AT an owner-raised floor instead of planning through it
+  (the inverter would stop discharging there and the shortfall would be paid
+  grid import until the derate/sustained-import failsafes caught it). An
+  owner-raised floor is NOT drift; the drift alert fires only when the floor
+  is below the forecast reserve. The floor is read once at PLAN — a mid-
+  morning change is picked up next day, bounded meanwhile by the hardware
+  floor and the import failsafes.
+  Fallback: if FoxESS unreachable at PLAN, use the forecast-only reserve
+  (hardware still enforces the floor); alert.
 
   forecast_house_load: rolling mean of same-half-hour load over last 5
   weekdays (or all days — configurable) from stored telemetry samples.

@@ -198,6 +198,24 @@ export async function runTick(
   const atHome =
     car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= HOME_RADIUS_M;
 
+  // PLAN-time read-only hardware-floor read, BEFORE decide so an owner-raised
+  // minSocOnGrid becomes the day's effective reserve (decide takes the max of
+  // it and the forecast). Only the FoxESS *read* is guarded by this try: a
+  // throw here means we genuinely couldn't read the floor — decide falls back
+  // to the forecast-only reserve and the inverter still enforces the floor in
+  // hardware. Keeping notify() calls outside the try stops a transient ntfy
+  // failure being relabeled "reserve floor verify failed" (and stops the
+  // catch doubling as an accidental resend).
+  let floorPct: number | null = null;
+  let floorReadErr: unknown;
+  if (!stored) {
+    try {
+      floorPct = await foxess.getMinSocOnGrid();
+    } catch (err) {
+      floorReadErr = err;
+    }
+  }
+
   const inputs: DecideInputs = {
     date,
     nowMins,
@@ -217,6 +235,7 @@ export async function runTick(
       shadowMode,
     },
     samples,
+    floorPct,
     stored,
   };
   const { actions, next } = decide(inputs);
@@ -246,7 +265,7 @@ export async function runTick(
           stored?.state ?? "PLAN",
           next.state,
           prefix + (actions.length ? actions.map(describeAction).join(" | ") : "none"),
-          JSON.stringify({ nowMins, car: inputs.car, house, cfg: inputs.cfg, before: stored, after: next }),
+          JSON.stringify({ nowMins, car: inputs.car, house, cfg: inputs.cfg, floorPct, before: stored, after: next }),
         )
         .run(),
     );
@@ -260,27 +279,22 @@ export async function runTick(
       .run(),
   );
 
-  // PLAN-time read-only hardware-floor verification (alert on drift).
-  // Only the FoxESS *read* is guarded by this try: a throw here means we
-  // genuinely couldn't verify the floor. The drift notify() lives OUTSIDE the
-  // try so a transient ntfy failure on a legitimate drift alert isn't caught
-  // and relabeled "reserve floor verify failed" — and so that catch stops
-  // doubling as an accidental resend of the drift message.
+  // PLAN-time hardware-floor verification (alert on drift), using the floor
+  // read above. An owner-raised floor is NOT drift — decide already adopted
+  // it as the effective reserve, so the alert only fires when the floor is
+  // genuinely below what the forecast says the house needs.
   if (!stored) {
-    let floor: number | undefined;
-    try {
-      floor = await foxess.getMinSocOnGrid();
-    } catch (err) {
+    if (floorReadErr !== undefined) {
+      const msg = floorReadErr instanceof Error ? floorReadErr.message : String(floorReadErr);
       if (!shadowMode) {
-        await notify(env, `reserve floor verify failed: ${err instanceof Error ? err.message : String(err)}`);
+        await notify(env, `reserve floor verify failed: ${msg}`);
       } else {
-        console.error("floor verify failed (shadow)", err);
+        console.error("floor verify failed (shadow)", floorReadErr);
       }
-    }
-    if (floor !== undefined && floor < next.reservePct && !shadowMode) {
+    } else if (floorPct !== null && floorPct < next.reservePct && !shadowMode) {
       await notify(
         env,
-        `FoxESS minSocOnGrid ${floor}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
+        `FoxESS minSocOnGrid ${floorPct}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
       );
     }
   }
