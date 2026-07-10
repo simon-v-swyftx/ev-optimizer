@@ -261,21 +261,27 @@ export async function runTick(
   );
 
   // PLAN-time read-only hardware-floor verification (alert on drift).
+  // Only the FoxESS *read* is guarded by this try: a throw here means we
+  // genuinely couldn't verify the floor. The drift notify() lives OUTSIDE the
+  // try so a transient ntfy failure on a legitimate drift alert isn't caught
+  // and relabeled "reserve floor verify failed" — and so that catch stops
+  // doubling as an accidental resend of the drift message.
   if (!stored) {
+    let floor: number | undefined;
     try {
-      const floor = await foxess.getMinSocOnGrid();
-      if (floor < next.reservePct && !shadowMode) {
-        await notify(
-          env,
-          `FoxESS minSocOnGrid ${floor}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
-        );
-      }
+      floor = await foxess.getMinSocOnGrid();
     } catch (err) {
       if (!shadowMode) {
         await notify(env, `reserve floor verify failed: ${err instanceof Error ? err.message : String(err)}`);
       } else {
         console.error("floor verify failed (shadow)", err);
       }
+    }
+    if (floor !== undefined && floor < next.reservePct && !shadowMode) {
+      await notify(
+        env,
+        `FoxESS minSocOnGrid ${floor}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
+      );
     }
   }
 }
@@ -400,9 +406,24 @@ export async function d1Retry<T>(fn: () => Promise<T>, delaysMs = [0, 500, 1500]
   throw lastErr;
 }
 
-export async function notify(env: Env, message: string): Promise<void> {
-  const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, { method: "POST", body: message });
-  // Fail loud: a swallowed 4xx/5xx here would make every failure path in the
-  // worker look successful with zero trace (invariant 2 in CLAUDE.md).
-  if (!res.ok) throw new Error(`ntfy ${res.status}: ${message}`);
+export async function notify(env: Env, message: string, delaysMs = [0, 500, 1500]): Promise<void> {
+  let lastErr: unknown;
+  for (const wait of delaysMs) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    let res: Response;
+    try {
+      res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, { method: "POST", body: message });
+    } catch (err) {
+      lastErr = err; // network-level failure (DNS/TLS/reset) — transient, retry
+      continue;
+    }
+    if (res.ok) return;
+    // Fail loud: a swallowed non-2xx here would make every failure path in the
+    // worker look successful with zero trace (invariant 2 in CLAUDE.md). A 5xx
+    // (e.g. ntfy behind Cloudflare returning 522) is transient, so retry; a 4xx
+    // is a real client error (bad topic) and surfaces immediately.
+    lastErr = new Error(`ntfy ${res.status}: ${message}`);
+    if (res.status < 500) throw lastErr;
+  }
+  throw lastErr;
 }
