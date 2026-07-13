@@ -198,6 +198,24 @@ export async function runTick(
   const atHome =
     car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= HOME_RADIUS_M;
 
+  // PLAN-time read-only hardware-floor read, BEFORE decide so an owner-raised
+  // minSocOnGrid becomes the day's effective reserve (decide takes the max of
+  // it and the forecast). Only the FoxESS *read* is guarded by this try: a
+  // throw here means we genuinely couldn't read the floor — decide falls back
+  // to the forecast-only reserve and the inverter still enforces the floor in
+  // hardware. Keeping notify() calls outside the try stops a transient ntfy
+  // failure being relabeled "reserve floor verify failed" (and stops the
+  // catch doubling as an accidental resend).
+  let floorPct: number | null = null;
+  let floorReadErr: unknown;
+  if (!stored) {
+    try {
+      floorPct = await foxess.getMinSocOnGrid();
+    } catch (err) {
+      floorReadErr = err;
+    }
+  }
+
   const inputs: DecideInputs = {
     date,
     nowMins,
@@ -217,6 +235,7 @@ export async function runTick(
       shadowMode,
     },
     samples,
+    floorPct,
     stored,
   };
   const { actions, next } = decide(inputs);
@@ -246,7 +265,7 @@ export async function runTick(
           stored?.state ?? "PLAN",
           next.state,
           prefix + (actions.length ? actions.map(describeAction).join(" | ") : "none"),
-          JSON.stringify({ nowMins, car: inputs.car, house, cfg: inputs.cfg, before: stored, after: next }),
+          JSON.stringify({ nowMins, car: inputs.car, house, cfg: inputs.cfg, floorPct, before: stored, after: next }),
         )
         .run(),
     );
@@ -260,22 +279,23 @@ export async function runTick(
       .run(),
   );
 
-  // PLAN-time read-only hardware-floor verification (alert on drift).
+  // PLAN-time hardware-floor verification (alert on drift), using the floor
+  // read above. An owner-raised floor is NOT drift — decide already adopted
+  // it as the effective reserve, so the alert only fires when the floor is
+  // genuinely below what the forecast says the house needs.
   if (!stored) {
-    try {
-      const floor = await foxess.getMinSocOnGrid();
-      if (floor < next.reservePct && !shadowMode) {
-        await notify(
-          env,
-          `FoxESS minSocOnGrid ${floor}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
-        );
-      }
-    } catch (err) {
+    if (floorReadErr !== undefined) {
+      const msg = floorReadErr instanceof Error ? floorReadErr.message : String(floorReadErr);
       if (!shadowMode) {
-        await notify(env, `reserve floor verify failed: ${err instanceof Error ? err.message : String(err)}`);
+        await notify(env, `reserve floor verify failed: ${msg}`);
       } else {
-        console.error("floor verify failed (shadow)", err);
+        console.error("floor verify failed (shadow)", floorReadErr);
       }
+    } else if (floorPct !== null && floorPct < next.reservePct && !shadowMode) {
+      await notify(
+        env,
+        `FoxESS minSocOnGrid ${floorPct}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
+      );
     }
   }
 }
@@ -400,9 +420,24 @@ export async function d1Retry<T>(fn: () => Promise<T>, delaysMs = [0, 500, 1500]
   throw lastErr;
 }
 
-export async function notify(env: Env, message: string): Promise<void> {
-  const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, { method: "POST", body: message });
-  // Fail loud: a swallowed 4xx/5xx here would make every failure path in the
-  // worker look successful with zero trace (invariant 2 in CLAUDE.md).
-  if (!res.ok) throw new Error(`ntfy ${res.status}: ${message}`);
+export async function notify(env: Env, message: string, delaysMs = [0, 500, 1500]): Promise<void> {
+  let lastErr: unknown;
+  for (const wait of delaysMs) {
+    if (wait) await new Promise((r) => setTimeout(r, wait));
+    let res: Response;
+    try {
+      res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, { method: "POST", body: message });
+    } catch (err) {
+      lastErr = err; // network-level failure (DNS/TLS/reset) — transient, retry
+      continue;
+    }
+    if (res.ok) return;
+    // Fail loud: a swallowed non-2xx here would make every failure path in the
+    // worker look successful with zero trace (invariant 2 in CLAUDE.md). A 5xx
+    // (e.g. ntfy behind Cloudflare returning 522) is transient, so retry; a 4xx
+    // is a real client error (bad topic) and surfaces immediately.
+    lastErr = new Error(`ntfy ${res.status}: ${message}`);
+    if (res.status < 500) throw lastErr;
+  }
+  throw lastErr;
 }

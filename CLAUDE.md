@@ -13,7 +13,9 @@ The EV charger is just a big house load: when the FoxESS is in Self-Use mode,
 starting the car at 11 kW makes the inverter discharge the home battery to
 cover it. So the controller manipulates the CAR (start/stop/amps via Tessie)
 and relies on one static, owner-set FoxESS floor (`minSocOnGrid`) as the
-hardware-enforced house reserve, which it verifies read-only.
+hardware-enforced house reserve, which it verifies read-only. 10% is the
+manufacturer BMS minimum; an owner-raised floor above the forecast reserve
+becomes the day's effective reserve (read once at PLAN, max of the two).
 
 ## Hardware facts (constants, do not guess)
 

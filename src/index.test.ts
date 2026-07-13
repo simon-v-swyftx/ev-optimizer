@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { d1Retry } from "./index";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { d1Retry, notify } from "./index";
 
 const overload = () => new Error("D1_ERROR: D1 DB is overloaded. Requests queued for too long");
 
@@ -40,5 +40,51 @@ describe("d1Retry", () => {
       }, [0, 0, 0]),
     ).rejects.toThrow("overloaded");
     expect(calls).toBe(3);
+  });
+});
+
+describe("notify", () => {
+  const env = { NTFY_TOPIC: "test-topic" } as unknown as Parameters<typeof notify>[0];
+  const resp = (status: number) => new Response(null, { status });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("sends once on a 2xx", async () => {
+    const fetch = vi.fn().mockResolvedValue(resp(200));
+    vi.stubGlobal("fetch", fetch);
+    await expect(notify(env, "hi", [0, 0, 0])).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a transient 5xx (ntfy 522 behind Cloudflare) and succeeds", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(resp(522))
+      .mockResolvedValueOnce(resp(522))
+      .mockResolvedValueOnce(resp(200));
+    vi.stubGlobal("fetch", fetch);
+    await expect(notify(env, "drift", [0, 0, 0])).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries a network-level failure and succeeds", async () => {
+    const fetch = vi.fn().mockRejectedValueOnce(new Error("connection reset")).mockResolvedValueOnce(resp(200));
+    vi.stubGlobal("fetch", fetch);
+    await expect(notify(env, "drift", [0, 0, 0])).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails loud immediately on a 4xx without retrying", async () => {
+    const fetch = vi.fn().mockResolvedValue(resp(404));
+    vi.stubGlobal("fetch", fetch);
+    await expect(notify(env, "hi", [0, 0, 0])).rejects.toThrow("ntfy 404");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws loud after the retry schedule is exhausted", async () => {
+    const fetch = vi.fn().mockResolvedValue(resp(522));
+    vi.stubGlobal("fetch", fetch);
+    await expect(notify(env, "drift", [0, 0, 0])).rejects.toThrow("ntfy 522");
+    expect(fetch).toHaveBeenCalledTimes(3);
   });
 });
