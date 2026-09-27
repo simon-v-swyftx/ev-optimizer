@@ -232,6 +232,7 @@ export async function runTick(
       safetyFactor: Number(cfg.get("safety_factor") ?? DEFAULT_SAFETY_FACTOR),
       strandedMinPct: Number(cfg.get("stranded_min_pct") ?? DEFAULT_STRANDED_MIN_PCT),
       solarTrack: cfg.get("solar_track") !== "false",
+      solarSoak: cfg.get("solar_soak") !== "false",
       shadowMode,
     },
     samples,

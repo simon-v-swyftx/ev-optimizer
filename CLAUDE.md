@@ -50,7 +50,7 @@ becomes the day's effective reserve (read once at PLAN, max of the two).
 ## Architecture
 
 - Runtime: Cloudflare Worker. Crons: `0 15 * * *` (01:00 Brisbane nightly
-  load pull) and `*/5 * * * *` (5-min tick, gated in code to 05:30–14:15
+  load pull) and `*/5 * * * *` (5-min tick, gated in code to 05:30–17:45
   Brisbane; SHADOW MODE until config shadow_mode='false' — see SPEC step 5)
 - State: D1 (SQLite) — see migrations/0001_init.sql
 - Car: Tessie API (https://api.tessie.com, bearer token) — handles command

@@ -5,7 +5,7 @@
  *  1. This file — physical facts and control-loop tuning, fixed at deploy.
  *  2. D1 `config` table — per-install runtime settings changed without a
  *     redeploy: home_lat/home_lon, shadow_mode, safety_factor,
- *     stranded_min_pct, solar_track (see migrations/0001_init.sql).
+ *     stranded_min_pct, solar_track, solar_soak (see migrations/0001_init.sql).
  *  3. Wrangler secrets — credentials (see .dev.vars.example).
  *
  * Values here document the reference install (SPEC.md). A fork should only
@@ -27,7 +27,7 @@ export const WINDOW_START_SLOT = WINDOW_START_MINS / 30;
 
 // --- Tick operating window (the 5-min cron is gated to this range) ---
 export const TICK_START_MINS = 5 * 60 + 30; // 05:30
-export const TICK_END_MINS = 14 * 60 + 15; // 14:15, a few ticks past window end so the stop lands
+export const TICK_END_MINS = 17 * 60 + 45; // 17:45, a few ticks past SOAK_END_MINS so the stop lands
 
 // --- Home battery ---
 export const BATTERY_KWH = 42; // usable capacity
@@ -61,3 +61,21 @@ export const SUSTAINED_IMPORT_W = 2000; // SOLAR_TRACK failsafe (amp commands fa
 export const SUSTAINED_IMPORT_TICKS = 3;
 export const RESERVE_REFILL_PCT = 5; // SOLAR_TRACK -> DUMPING once SoC > reserve + this
 export const START_CONFIRM_TICKS = 2; // invariant 4: ticks to see "Charging" after a start
+
+// --- Morning solar bank (SOLAR_TRACK, src/tick.ts) ---
+/** Resume at MIN_AMPS once the energy banked above reserve plus the current
+ *  PV surplus can carry the car's minimum for this long. */
+export const BANK_RUN_MINS = 20;
+
+// --- Afternoon solar soak (SOLAR_SOAK, src/tick.ts) ---
+// After 14:00 the battery is full and Self-Use curtails the PV it can't
+// place. The car soaks it up; the full battery is only a short-term buffer.
+export const SOAK_END_MINS = 17 * 60 + 30; // hard stop, well before the 18:00 export
+export const SOAK_LAST_START_MINS = 16 * 60 + 30; // no fresh starts after this
+export const SOAK_START_SOC = 97; // battery "full" (PV likely curtailed): start / probe up
+export const SOAK_MIN_SOC = 90; // hard stop: never lend the car more than ~4 kWh
+export const SOAK_DISCHARGE_W = 300; // battery discharge beyond this = car outrunning PV
+export const SOAK_LOW_TICKS = 2; // at MIN_AMPS and discharging this long -> stop (rides out a cloud)
+export const SOAK_STEP_HOLD_TICKS = 3; // after a step down, wait before probing up again
+export const SOAK_RESTART_HOLD_TICKS = 6; // 30 min between a soak stop and a restart
+export const SOAK_MAX_STARTS = 3; // contactor-wear cap per afternoon
