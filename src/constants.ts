@@ -62,6 +62,18 @@ export const SUSTAINED_IMPORT_TICKS = 3;
 export const RESERVE_REFILL_PCT = 5; // SOLAR_TRACK -> DUMPING once SoC > reserve + this
 export const START_CONFIRM_TICKS = 2; // invariant 4: ticks to see "Charging" after a start
 
+// --- Grid-offline guard (src/tick.ts) ---
+/** FoxESS runningState meaning off-grid (community docs; 163 = on-grid).
+ *  Also reported when the datalogger drops offline — stopping then is still
+ *  right: the readings are stale and we're flying blind. */
+export const OFF_GRID_RUNNING_STATE = 164;
+/** Fallback detector: in the free window ForceCharge feeds the car from the
+ *  grid, so a battery discharging this hard means the grid isn't there. */
+export const WINDOW_DRAIN_W = 2000;
+/** Skip the first ticks of the window: cloud readings can lag the 11:00
+ *  switch into ForceCharge by a few minutes. */
+export const WINDOW_DRAIN_GRACE_MINS = 10;
+
 // --- Morning solar bank (SOLAR_TRACK, src/tick.ts) ---
 /** Resume at MIN_AMPS once the energy banked above reserve plus the current
  *  PV surplus can carry the car's minimum for this long. */

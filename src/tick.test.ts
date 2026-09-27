@@ -34,6 +34,7 @@ function stored(over: Partial<StoredState> = {}): StoredState {
     soakStarts: 0,
     soakHold: 0,
     soakLowTicks: 0,
+    gridDown: null,
     ...over,
   };
 }
@@ -63,11 +64,11 @@ describe("PLAN (first tick of day)", () => {
     expect(next.solarResumes).toBe(0);
   });
 
-  it("adopts an owner-raised minSocOnGrid above the forecast as the effective reserve", () => {
+  it("reserves the house's energy ON TOP of an owner-raised minSocOnGrid", () => {
     const i = base();
-    i.floorPct = 35; // owner raised it in the FoxESS app; forecast says 26
+    i.floorPct = 35; // owner raised it in the FoxESS app; house needs 16% until 11:00
     const { next } = decide(i);
-    expect(next.reservePct).toBe(35);
+    expect(next.reservePct).toBe(51); // 35 + 16: the house never runs on grid at the floor
   });
 
   it("keeps the forecast reserve when the floor is at the 10% BMS minimum", () => {
@@ -77,7 +78,7 @@ describe("PLAN (first tick of day)", () => {
     expect(next.reservePct).toBe(26);
   });
 
-  it("falls back to the forecast reserve when the floor read failed (null)", () => {
+  it("assumes the 10% BMS minimum when the floor read failed (null)", () => {
     const i = base();
     i.floorPct = null;
     const { next } = decide(i);
@@ -744,6 +745,92 @@ describe("SOLAR_SOAK (after the window)", () => {
     const { actions, next } = decide(i);
     expect(actions).toEqual([{ kind: "set_amps", amps: 9 }]);
     expect(next.soakHold).toBe(0);
+  });
+});
+
+describe("grid-offline guard", () => {
+  it("off-grid: stops a system charge immediately, alerts once, blocks starts", () => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.house.runningState = 164;
+    i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
+    const first = decide(i);
+    expect(first.actions).toContainEqual({ kind: "stop_charging", reason: "grid_offline" });
+    expect(kinds(first.actions).filter((k) => k === "notify")).toHaveLength(1);
+    expect(first.next.gridDown).toBe("offgrid");
+    // next tick: car stopped, still off-grid, battery well above reserve -> no restart, no repeat alert
+    const second = decide({ ...i, car: { ...i.car, chargingState: "Stopped" }, stored: first.next });
+    expect(second.actions).toHaveLength(0);
+  });
+
+  it("applies in every phase: free window and afternoon soak", () => {
+    for (const [nowMins, state] of [
+      [12 * 60, "FREE_WINDOW"],
+      [15 * 60, "SOLAR_SOAK"],
+    ] as const) {
+      const i = base();
+      i.nowMins = nowMins;
+      i.car.chargingState = "Charging";
+      i.house = { socPct: 100, loadW: 11440, gridImportW: 0, pvW: 0, feedinW: 0, runningState: 164 };
+      i.stored = stored({ state, sessionOwner: "system", lastAmps: 16 });
+      const { actions } = decide(i);
+      expect(actions).toContainEqual({ kind: "stop_charging", reason: "grid_offline" });
+      expect(kinds(actions)).not.toContain("set_amps");
+      expect(kinds(actions)).not.toContain("start_charging");
+    }
+  });
+
+  it("back on-grid: clears, notes it, and normal charging resumes", () => {
+    const i = base();
+    i.house.runningState = 163;
+    i.stored = stored({ state: "DUMPING", gridDown: "offgrid" });
+    const { actions, next } = decide(i);
+    expect(next.gridDown).toBeNull();
+    expect(kinds(actions)).toEqual(["notify", "start_charging"]);
+  });
+
+  it("runningState missing: stays latched rather than guessing the grid is back", () => {
+    const i = base();
+    i.stored = stored({ state: "DUMPING", gridDown: "offgrid" });
+    expect(decide(i).actions).toHaveLength(0);
+  });
+
+  it("never stops an owner session (invariant 6), but the alert says so", () => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.house.runningState = 164;
+    i.stored = stored({ state: "IDLE", sessionOwner: "owner", manualNoted: true });
+    const { actions } = decide(i);
+    expect(kinds(actions)).toEqual(["notify"]);
+    expect((actions[0] as { message: string }).message).toContain("owner-started");
+  });
+
+  it("fallback: battery feeding the car in the window latches for the day", () => {
+    const i = base();
+    i.nowMins = 11 * 60 + 15;
+    i.car.chargingState = "Charging";
+    // no runningState; 11 kW load, no grid import, no PV -> battery covering it
+    i.house = { socPct: 60, loadW: 11440, gridImportW: 0, pvW: 0, feedinW: 0 };
+    i.stored = stored({ state: "FREE_WINDOW", sessionOwner: "system", lastAmps: 16 });
+    const first = decide(i);
+    expect(first.actions).toContainEqual({ kind: "stop_charging", reason: "grid_offline" });
+    expect(first.next.gridDown).toBe("drain");
+    // car off -> symptom gone, but still no restart
+    const later = { ...i, car: { ...i.car, chargingState: "Stopped" }, stored: first.next };
+    later.house = { socPct: 59, loadW: 400, gridImportW: 0, pvW: 0, feedinW: 0 };
+    expect(decide(later).actions).toHaveLength(0);
+  });
+
+  it("fallback ignores the first 10 min of the window (lagging readings) and normal grid charging", () => {
+    const early = base();
+    early.nowMins = 11 * 60 + 5;
+    early.car.chargingState = "Charging";
+    early.house = { socPct: 60, loadW: 11440, gridImportW: 0, pvW: 0, feedinW: 0 };
+    early.stored = stored({ state: "FREE_WINDOW", sessionOwner: "system", lastAmps: 16 });
+    expect(decide(early).next.gridDown).toBeNull();
+    const normal = { ...early, nowMins: 12 * 60 };
+    normal.house = { socPct: 60, loadW: 11440, gridImportW: 20000, pvW: 1000, feedinW: 0 }; // grid feeds car + battery
+    expect(decide(normal).actions).toHaveLength(0);
   });
 });
 

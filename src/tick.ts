@@ -9,6 +9,7 @@ import {
   MAX_AMPS,
   MAX_SOLAR_RESUMES,
   MIN_AMPS,
+  OFF_GRID_RUNNING_STATE,
   RECOVER_IMPORT_W,
   RESERVE_BLEED_W,
   RESERVE_REFILL_PCT,
@@ -28,6 +29,8 @@ import {
   SUSTAINED_IMPORT_TICKS,
   SUSTAINED_IMPORT_W,
   W_PER_AMP,
+  WINDOW_DRAIN_GRACE_MINS,
+  WINDOW_DRAIN_W,
   WINDOW_END_MINS,
   WINDOW_START_MINS,
 } from "./constants";
@@ -61,11 +64,20 @@ export interface StoredState {
   soakStarts: number; // SOLAR_SOAK starts today (wear cap)
   soakHold: number; // SOLAR_SOAK ticks to wait before probing up / restarting
   soakLowTicks: number; // SOLAR_SOAK consecutive ticks at MIN_AMPS with battery discharging
+  /** Grid-offline guard: "offgrid" = inverter reports off-grid (clears when it
+   *  reports anything else); "drain" = battery feeding the car in the free
+   *  window (latched for the day — the car being off hides the symptom). */
+  gridDown: "offgrid" | "drain" | null;
 }
 
 /** Fields added after go-live; a state row persisted by an older build lacks
  *  them, so they are defaulted when the row is loaded mid-day. */
-const LATE_FIELDS = { soakStarts: 0, soakHold: 0, soakLowTicks: 0 };
+const LATE_FIELDS: Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown"> = {
+  soakStarts: 0,
+  soakHold: 0,
+  soakLowTicks: 0,
+  gridDown: null,
+};
 
 export interface DecideInputs {
   date: string;
@@ -84,6 +96,7 @@ export interface DecideInputs {
     gridImportW: number;
     pvW: number | null; // null = inverter doesn't report it
     feedinW: number | null;
+    runningState?: number | null; // FoxESS mode code; absent = unknown
   };
   cfg: {
     safetyFactor: number;
@@ -95,12 +108,12 @@ export interface DecideInputs {
   /** Half-hour load history for PLAN; only read on the first tick of a day. */
   samples: { slot: number; loadKwh: number }[];
   /** FoxESS minSocOnGrid, read (read-only) at PLAN. 10% is the manufacturer
-   *  BMS minimum; the owner may raise it in the FoxESS app, and an owner-set
-   *  floor above the forecast reserve becomes the day's effective reserve —
-   *  so the software stops dumping AT the hardware floor instead of planning
-   *  through it (the inverter would stop discharging and the shortfall would
-   *  be paid grid import). null = read failed or not the first tick of a day;
-   *  falls back to the forecast reserve (hardware still enforces the floor). */
+   *  BMS minimum; the owner may raise it in the FoxESS app. The house's
+   *  forecast energy until 11:00 is reserved ON TOP of this floor — the
+   *  inverter won't discharge below it, so energy at/below the floor can't
+   *  run the house (it would be paid grid import). null = read failed or not
+   *  the first tick of a day; assumes the 10% minimum (hardware still
+   *  enforces the real floor, and an import stop learns it). */
   floorPct: number | null;
   stored: StoredState | null;
 }
@@ -121,17 +134,16 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       : {
           date: i.date,
           state: "IDLE",
-          // Owner-raised hardware floor wins over the forecast (see
-          // DecideInputs.floorPct); the drift alert covers the other drift.
-          reservePct: Math.max(
-            reservePct({
-              nowSlot: Math.floor(i.nowMins / 30),
-              samples: i.samples,
-              safetyFactor: i.cfg.safetyFactor,
-              batteryKwh: BATTERY_KWH,
-            }),
-            i.floorPct ?? 0,
-          ),
+          // House energy until 11:00 on top of the hardware floor (see
+          // DecideInputs.floorPct). Floor unknown -> 10% BMS minimum; the
+          // learned-floor rule catches a higher one from import evidence.
+          reservePct: reservePct({
+            nowSlot: Math.floor(i.nowMins / 30),
+            samples: i.samples,
+            safetyFactor: i.cfg.safetyFactor,
+            batteryKwh: BATTERY_KWH,
+            floorPct: i.floorPct ?? undefined,
+          }),
           sessionOwner: null,
           startPending: -1,
           startBlocked: false,
@@ -158,7 +170,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     s.startPending = 0;
     s.lastAmps = amps;
   };
-  const canStart = () => !s.startBlocked && s.startPending < 0;
+  const canStart = () => !s.startBlocked && s.startPending < 0 && s.gridDown === null;
   // Grid import while the car runs above reserve means the battery would not
   // discharge at this SoC (hardware floor above the planned reserve — e.g. the
   // PLAN floor read failed — or a derated battery). Adopt that SoC as today's
@@ -214,6 +226,41 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   if (!charging && s.sessionOwner === "owner") {
     s.sessionOwner = null;
     s.manualNoted = false; // next manual session gets its own note
+  }
+
+  // --- Grid-offline guard (owner, 2026-09-27) ---
+  // Without the grid there's no knowing when the house is reconnected, so the
+  // house battery is for the house only: stop our charge at once and start
+  // nothing until the grid is back.
+  const rs = i.house.runningState;
+  const wasDown = s.gridDown;
+  if (rs === OFF_GRID_RUNNING_STATE) {
+    if (s.gridDown === null) s.gridDown = "offgrid";
+  } else if (s.gridDown === "offgrid" && rs !== null && rs !== undefined) {
+    s.gridDown = null;
+    a.push({ kind: "notify", message: `inverter back on-grid (runningState ${rs}) — car charging resumes normally` });
+  }
+  if (
+    s.gridDown === null &&
+    i.nowMins >= WINDOW_START_MINS + WINDOW_DRAIN_GRACE_MINS &&
+    i.nowMins < WINDOW_END_MINS &&
+    i.house.pvW !== null &&
+    i.house.feedinW !== null &&
+    i.house.feedinW - i.house.gridImportW - (i.house.pvW - i.house.loadW) > WINDOW_DRAIN_W
+  ) {
+    s.gridDown = "drain"; // fallback when runningState is missing or doesn't flip
+  }
+  if (s.gridDown !== null && wasDown === null) {
+    const why =
+      s.gridDown === "offgrid"
+        ? `inverter reports off-grid (runningState ${rs})`
+        : "house battery discharging in the free window (grid down or ForceCharge not running)";
+    const owner = s.sessionOwner === "owner" && charging ? " An owner-started charge is still running — stop it in the Tesla app." : "";
+    const until = s.gridDown === "offgrid" ? "until it's back on-grid" : "for the rest of today";
+    a.push({ kind: "notify", message: `${why}: car charging stopped, no starts ${until}.${owner}` });
+  }
+  if (s.gridDown !== null && charging && s.sessionOwner === "system" && i.car.atHome) {
+    stop("grid_offline");
   }
 
   // No command ever leaves while away/unknown (invariant 7) or during an

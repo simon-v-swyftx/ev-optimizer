@@ -60,6 +60,7 @@ export class FoxEssClient {
     gridImportW: number;
     pvW: number | null;
     feedinW: number | null;
+    runningState: number | null;
   }> {
     // v0 real/query is deprecated; v1 takes an sns array. Battery variables
     // carry a bank-index suffix on (at least) this inverter: SoC_1, not SoC
@@ -68,7 +69,7 @@ export class FoxEssClient {
       { deviceSN: string; datas: { variable: string; value: number }[] }[]
     >("/op/v1/device/real/query", {
       sns: [this.deviceSn],
-      variables: ["SoC", "SoC_1", "loadsPower", "gridConsumptionPower", "pvPower", "feedinPower"],
+      variables: ["SoC", "SoC_1", "loadsPower", "gridConsumptionPower", "pvPower", "feedinPower", "runningState"],
     });
     const datas = result[0]?.datas ?? [];
     const get = (...names: string[]): number => {
@@ -91,6 +92,14 @@ export class FoxEssClient {
       gridImportW: Math.round(get("gridConsumptionPower") * 1000), // kW -> W
       pvW: opt("pvPower"),
       feedinW: opt("feedinPower"),
+      // Inverter mode code (163 on-grid, 164 off-grid per community docs —
+      // UNVERIFIED on this device, confirm via /debug/foxess). Raw, no kW
+      // scaling; optional like pv/feedin. Used by the grid-offline guard.
+      runningState: (() => {
+        const v = datas.find((d) => d.variable === "runningState")?.value;
+        const n = typeof v === "number" ? v : Number(v);
+        return Number.isFinite(n) ? n : null;
+      })(),
     };
   }
 

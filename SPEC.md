@@ -66,8 +66,18 @@ first-tick-of-day event (creates the day's stored state), not a state.
 
 PLAN (first tick of day, ~05:30)
   reserve_kwh = forecast_house_load(now → 11:00) × safety_factor(1.3)
-  reserve_pct = clamp(ceil(reserve_kwh / 42 × 100) + 10 /*BMS floor*/, 10, 100)
-  Floor strategy (decided 2026-07-04, confirm with ~2 weeks of data): the
+  reserve_pct = clamp(ceil(reserve_kwh / 42 × 100) + floor, 10, 100)
+    where floor = max(10, minSocOnGrid read at PLAN; 10 if the read fails)
+  Reserve ON TOP of the floor (owner, 2026-09-27 — supersedes the
+  "effective reserve = max(forecast, floor)" rule and the floor-drift alert
+  below): the owner never wants the house on grid because the battery hit
+  its minimum. The inverter won't discharge below minSocOnGrid, so the
+  house's energy until 11:00 must sit above it, whatever the floor is. Every
+  floor ≥ 10% is therefore valid and there is no "floor too low" alert;
+  only a failed floor read alerts. With the floor at 10% this is exactly the
+  original formula. A floor read failure assumes 10%; if the real floor is
+  higher, the first import stop learns it (see SOLAR_TRACK "Learned floor").
+  Original floor strategy, SUPERSEDED where it conflicts with the above (decided 2026-07-04, confirm with ~2 weeks of data): the
   house load is flat (~0.4 kW), so reserve_pct is expected to be near-constant
   (~17–20%). Plan of record: the owner sets minSocOnGrid ONCE, manually, in
   the FoxESS app at step-5 go-live; the controller stays READ-ONLY on the
@@ -286,8 +296,8 @@ default (trades overnight house autonomy for car charge).
     18:00–21:00 ForceDischarge to grid, NO fdSoC floor — owner duration-tunes
                 it to export ~15 kWh (feed-in tariff pays well only on the
                 first 15 kWh/day); battery ends ~50% by 21:00
-    otherwise   Self-Use, minSocOnGrid currently 10% (owner raises it to the
-                static reserve, ~18–20%, at step-5 go-live)
+    otherwise   Self-Use, minSocOnGrid 10% (the old plan to raise it to the
+                reserve is dropped: the reserve now sits on top of it)
   The owner may manually skip the evening export before a long drive; that
   stays a manual FoxESS-app action (no calendar awareness).
 - Nightly job (LIVE since 2026-07-04, cron 0 15 * * * UTC = 01:00 Brisbane):
@@ -396,6 +406,19 @@ default (trades overnight house autonomy for car charge).
   successful tick). Bounded cost. The kept native Tesla 11:00 schedule
   still delivers the free-window charge with zero working software.
 - FoxESS API down at PLAN: reuse yesterday's reserve; alert.
+- Grid offline (owner, 2026-09-27): no knowing when the house is
+  reconnected, so the battery is for the house only. The real-time read
+  also requests runningState (163 on-grid / 164 off-grid per community
+  docs — UNVERIFIED on this device, confirm via /debug/foxess; 164 is
+  also reported when the datalogger drops offline, when stopping is
+  still right). 164 → stop the system charge that tick, one alert, no
+  starts in any state until runningState reports anything else (then one
+  "back on-grid" note). Missing runningState never clears it. Fallback
+  (variable missing or not flipping): from 11:10 to 14:00 ForceCharge
+  should feed the car from the grid, so battery discharge (energy
+  balance, as SOLAR_SOAK) > 2 kW → same stop + alert, latched for the
+  day, since the stopped car hides the symptom. Owner sessions are never
+  stopped (invariant 6); the alert tells the owner to stop it in the app.
 - Tessie down: cannot start/stop car. House protected by floor. Alert.
 - Command accepted but car not charging: alert after 2 ticks.
 - Car plugged in away from home (work, supercharger, anywhere): geofence
@@ -451,8 +474,9 @@ default (trades overnight house autonomy for car charge).
    per 3 h (every failure still logged to decisions). PLAN verifies
    minSocOnGrid read-only via /op/v0/device/battery/soc/get (endpoint
    shape unverified — fails soft with an alert). GO-LIVE checklist after
-   the shadow week: review decisions log → owner raises minSocOnGrid to
-   the static reserve → set config shadow_mode='false'. The Tesla native
+   the shadow week: review decisions log → set config
+   shadow_mode='false'. (The "owner raises minSocOnGrid to the static
+   reserve" step was dropped 2026-09-27: the reserve sits on top of it.) The Tesla native
    11:00–14:00 schedule stays ON as the dead-controller backstop (adoption
    rule, see Tessie integration).
 6. Dashboard last (TanStack Start reading D1 via the Worker, or just
