@@ -157,6 +157,16 @@ describe("DUMPING", () => {
     expect(actions).toContainEqual({ kind: "stop_charging", reason: "reserve_hit" });
   });
 
+  it("8 kW floor hit above the planned reserve: learns the floor and stops the same tick", () => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.house = { socPct: 30, loadW: 11440, gridImportW: 11440, pvW: 0, feedinW: 0 };
+    i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16, reservePct: 17 });
+    const { actions, next } = decide(i);
+    expect(next.reservePct).toBe(30);
+    expect(actions).toContainEqual({ kind: "stop_charging", reason: "reserve_hit" });
+  });
+
   it("exits to SOLAR_TRACK on the 8 kW import backstop even above the SoC floor", () => {
     const i = base();
     i.car.chargingState = "Charging";
@@ -326,6 +336,33 @@ describe("SOLAR_TRACK", () => {
     const off = solar({ socPct: 20, pvW: 3000 });
     off.cfg.solarTrack = false;
     expect(decide(off).actions).toHaveLength(0);
+  });
+
+  it("hardware floor above the stored reserve: an import stop is not followed by a bank restart (review fix)", () => {
+    // PLAN floor read failed -> forecast reserve 27, but the owner's floor is
+    // 30: at 30% the inverter won't discharge and the 5 A car imports.
+    const i = solar(
+      { socPct: 30, loadW: 3850, pvW: 1000, gridImportW: 2850 },
+      { sessionOwner: "system", lastAmps: 5, reservePct: 27 },
+    );
+    i.car.chargingState = "Charging";
+    const stop = decide(i);
+    expect(stop.actions).toContainEqual({ kind: "stop_charging", reason: "below_solar_min" });
+    expect(stop.next.reservePct).toBe(30); // learned: the battery won't go lower today
+    // next tick, car off, house covered: 3% "above reserve" no longer counts as a bank
+    const after = solar({ socPct: 30, loadW: 400, pvW: 1000 }, stop.next);
+    const r = decide(after);
+    expect(kinds(r.actions)).not.toContain("start_charging");
+    expect(r.next.solarResumes).toBe(0);
+  });
+
+  it("the learned reserve only ever rises", () => {
+    const i = solar(
+      { socPct: 18, loadW: 3850, pvW: 3450, gridImportW: 400 },
+      { sessionOwner: "system", lastAmps: 5, reservePct: 25 },
+    );
+    i.car.chargingState = "Charging";
+    expect(decide(i).next.reservePct).toBe(25);
   });
 
   it("bounces back to DUMPING when PV lifts the battery over reserve + 5", () => {

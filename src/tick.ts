@@ -159,6 +159,15 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     s.lastAmps = amps;
   };
   const canStart = () => !s.startBlocked && s.startPending < 0;
+  // Grid import while the car runs above reserve means the battery would not
+  // discharge at this SoC (hardware floor above the planned reserve — e.g. the
+  // PLAN floor read failed — or a derated battery). Adopt that SoC as today's
+  // effective reserve so no path (bank restart, reserve + 5 re-entry) starts
+  // the car on paid grid again. Only ever raises: conservative, like the
+  // owner-raised-floor rule at PLAN.
+  const learnFloor = () => {
+    s.reservePct = Math.min(100, Math.max(s.reservePct, i.house.socPct));
+  };
 
   // --- Session bookkeeping (invariants 4 + 6) ---
   if (charging && s.sessionOwner === null) {
@@ -278,7 +287,12 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   } else if (st === "IDLE") {
     st = i.house.socPct > s.reservePct ? "DUMPING" : "SOLAR_TRACK";
   } else if (st === "DUMPING") {
-    if (i.house.socPct <= s.reservePct || i.house.gridImportW > FLOOR_IMPORT_W) st = "SOLAR_TRACK";
+    if (i.house.gridImportW > FLOOR_IMPORT_W) {
+      learnFloor(); // floor hit before a SoC read caught it: reserve_hit stops the car this tick
+      st = "SOLAR_TRACK";
+    } else if (i.house.socPct <= s.reservePct) {
+      st = "SOLAR_TRACK";
+    }
   } else if (st === "SOLAR_TRACK") {
     if (i.house.socPct > s.reservePct + RESERVE_REFILL_PCT) st = "DUMPING"; // PV refilled the battery: recover it at full rate
   }
@@ -325,6 +339,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
         if (i.house.gridImportW > SUSTAINED_IMPORT_W) {
           if (++s.highImportTicks >= SUSTAINED_IMPORT_TICKS) {
             stop("sustained_import");
+            learnFloor();
             a.push({ kind: "notify", message: "SOLAR_TRACK: sustained grid import — stopped charge" });
             s.highImportTicks = 0;
           }
@@ -343,6 +358,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           const target = Math.min(MAX_AMPS, Math.max(MIN_AMPS, s.lastAmps + delta));
           if (target === MIN_AMPS && s.lastAmps === MIN_AMPS && i.house.gridImportW > STOP_IMPORT_W) {
             stop("below_solar_min"); // surplus can't sustain the car's 3.45 kW minimum
+            learnFloor();
           } else if (target !== s.lastAmps) {
             a.push({ kind: "set_amps", amps: target });
             s.lastAmps = target;

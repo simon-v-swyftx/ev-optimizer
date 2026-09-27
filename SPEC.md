@@ -154,7 +154,13 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
     morning the owner leaves before 11:00, up to that much PV was left in
     a battery that refills free at 11:00 anyway. Now at most ~1–4% is left
     stranded, and the car runs gently at 5 A (amp loop above) until
-    reserve_hit. Counts against the same 4-resume daily wear cap; past the
+    reserve_hit. Learned floor (review fix, 2026-09-27): a below_solar_min
+    or sustained_import stop, or DUMPING's 8 kW import exit, raises the
+    day's reserve to the current SoC — import above the planned reserve
+    proves the battery won't discharge there (hardware floor above plan,
+    e.g. PLAN's floor read failed, or a derated battery). Without it the
+    bank restart saw "3% above reserve" and restarted onto paid grid every
+    tick until the cap. Only ever raises. Counts against the same 4-resume daily wear cap; past the
     cap the reserve + 5 DUMPING re-entry still applies. Battery above
     reserve covers any shortfall, so no import. Gated on solar_track.
     Sun-only resume (unchanged): at 5 A only when the last 3 ticks (15 min) ALL showed
