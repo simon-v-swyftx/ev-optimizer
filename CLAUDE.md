@@ -12,10 +12,11 @@ is the operational summary.
 The EV charger is just a big house load: when the FoxESS is in Self-Use mode,
 starting the car at 11 kW makes the inverter discharge the home battery to
 cover it. So the controller manipulates the CAR (start/stop/amps via Tessie)
-and relies on one static, owner-set FoxESS floor (`minSocOnGrid`) as the
-hardware-enforced house reserve, which it verifies read-only. 10% is the
-manufacturer BMS minimum; an owner-raised floor above the forecast reserve
-becomes the day's effective reserve (read once at PLAN, max of the two).
+and relies on one static, owner-set FoxESS floor (`minSocOnGrid`, read-only,
+once at PLAN) as the hardware backstop. The house's forecast energy until
+11:00 is reserved ON TOP of that floor (10% BMS minimum unless the owner
+raised it), so the house never runs on grid because the battery hit its
+minimum.
 
 ## Hardware facts (constants, do not guess)
 
@@ -29,8 +30,10 @@ becomes the day's effective reserve (read once at PLAN, max of the two).
 
 ## Non-negotiable safety invariants
 
-1. Never set FoxESS `minSocOnGrid` below the computed house reserve, and never
-   below 10%.
+1. The house reserve sits on top of FoxESS `minSocOnGrid` (never below the
+   10% BMS minimum); the controller never writes inverter settings. If the
+   grid is offline, stop the system's charge immediately and start nothing
+   until it's back — the house battery is for the house.
 2. Every failure mode must degrade to "slightly suboptimal", never "flat house
    battery" or "car misses charge with no alert". The inverter floor and the
    car's own charge limit are the backstops — the software must never remove
@@ -50,7 +53,7 @@ becomes the day's effective reserve (read once at PLAN, max of the two).
 ## Architecture
 
 - Runtime: Cloudflare Worker. Crons: `0 15 * * *` (01:00 Brisbane nightly
-  load pull) and `*/5 * * * *` (5-min tick, gated in code to 05:30–14:15
+  load pull) and `*/5 * * * *` (5-min tick, gated in code to 05:30–17:45
   Brisbane; SHADOW MODE until config shadow_mode='false' — see SPEC step 5)
 - State: D1 (SQLite) — see migrations/0001_init.sql
 - Car: Tessie API (https://api.tessie.com, bearer token) — handles command

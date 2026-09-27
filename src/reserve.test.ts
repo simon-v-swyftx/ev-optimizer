@@ -4,6 +4,13 @@ import { reservePct } from "./reserve";
 const base = { safetyFactor: 1.3, batteryKwh: 42 };
 
 describe("reservePct", () => {
+  it("adds the forecast on top of a raised floor; below-minimum floors count as 10", () => {
+    // 7.15 kWh -> ceil(17.02) = 18 on top of the floor
+    expect(reservePct({ ...base, nowSlot: 11, samples: [], floorPct: 20 })).toBe(38);
+    expect(reservePct({ ...base, nowSlot: 11, samples: [], floorPct: 5 })).toBe(28);
+    expect(reservePct({ ...base, nowSlot: 11, samples: [], floorPct: 95 })).toBe(100);
+  });
+
   it("bootstrap: no history, plan at 05:30 (slot 11)", () => {
     // 11 slots x 0.5 kWh = 5.5 kWh x 1.3 = 7.15 -> ceil(17.02) + 10 = 28
     expect(reservePct({ ...base, nowSlot: 11, samples: [] })).toBe(28);

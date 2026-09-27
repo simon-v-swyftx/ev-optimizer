@@ -198,12 +198,11 @@ export async function runTick(
   const atHome =
     car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= HOME_RADIUS_M;
 
-  // PLAN-time read-only hardware-floor read, BEFORE decide so an owner-raised
-  // minSocOnGrid becomes the day's effective reserve (decide takes the max of
-  // it and the forecast). Only the FoxESS *read* is guarded by this try: a
-  // throw here means we genuinely couldn't read the floor — decide falls back
-  // to the forecast-only reserve and the inverter still enforces the floor in
-  // hardware. Keeping notify() calls outside the try stops a transient ntfy
+  // PLAN-time read-only hardware-floor read, BEFORE decide: the house's
+  // forecast energy is reserved on top of minSocOnGrid. Only the FoxESS
+  // *read* is guarded by this try: a throw here means we genuinely couldn't
+  // read the floor — decide assumes the 10% minimum, the inverter still
+  // enforces the real floor in hardware, and an import stop learns it. Keeping notify() calls outside the try stops a transient ntfy
   // failure being relabeled "reserve floor verify failed" (and stops the
   // catch doubling as an accidental resend).
   let floorPct: number | null = null;
@@ -232,6 +231,7 @@ export async function runTick(
       safetyFactor: Number(cfg.get("safety_factor") ?? DEFAULT_SAFETY_FACTOR),
       strandedMinPct: Number(cfg.get("stranded_min_pct") ?? DEFAULT_STRANDED_MIN_PCT),
       solarTrack: cfg.get("solar_track") !== "false",
+      solarSoak: cfg.get("solar_soak") !== "false",
       shadowMode,
     },
     samples,
@@ -279,23 +279,15 @@ export async function runTick(
       .run(),
   );
 
-  // PLAN-time hardware-floor verification (alert on drift), using the floor
-  // read above. An owner-raised floor is NOT drift — decide already adopted
-  // it as the effective reserve, so the alert only fires when the floor is
-  // genuinely below what the forecast says the house needs.
-  if (!stored) {
-    if (floorReadErr !== undefined) {
-      const msg = floorReadErr instanceof Error ? floorReadErr.message : String(floorReadErr);
-      if (!shadowMode) {
-        await notify(env, `reserve floor verify failed: ${msg}`);
-      } else {
-        console.error("floor verify failed (shadow)", floorReadErr);
-      }
-    } else if (floorPct !== null && floorPct < next.reservePct && !shadowMode) {
-      await notify(
-        env,
-        `FoxESS minSocOnGrid ${floorPct}% < computed reserve ${next.reservePct}% — raise it in the FoxESS app`,
-      );
+  // PLAN-time floor read failure alert. There is no "floor too low" drift
+  // alert any more: the reserve sits ON TOP of whatever floor is set, so
+  // every floor >= the 10% BMS minimum is valid (2026-09-27).
+  if (!stored && floorReadErr !== undefined) {
+    const msg = floorReadErr instanceof Error ? floorReadErr.message : String(floorReadErr);
+    if (!shadowMode) {
+      await notify(env, `reserve floor read failed (assuming 10%): ${msg}`);
+    } else {
+      console.error("floor read failed (shadow)", floorReadErr);
     }
   }
 }

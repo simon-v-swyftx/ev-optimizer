@@ -2,7 +2,13 @@
  * House reserve calculation. See SPEC.md "PLAN".
  *
  * reserve_kwh = forecast house load from `nowSlot` until 11:00 x safetyFactor
- * reserve_pct = ceil(reserve_kwh / batteryKwh * 100) + 10 (BMS floor), clamped 10..100
+ * reserve_pct = ceil(reserve_kwh / batteryKwh * 100) + floor, clamped 10..100
+ *
+ * `floor` is the FoxESS minSocOnGrid (10% BMS minimum unless the owner raised
+ * it). The house's energy sits ON TOP of it: the inverter won't discharge
+ * below the floor, so a reserve AT the floor would leave the house on paid
+ * grid until 11:00 (owner, 2026-09-27: never pull from grid because the
+ * battery hit its minimum).
  *
  * Forecast per half-hour slot = mean of `samples` rows for that slot; the
  * caller passes rows already filtered to the days it wants averaged (e.g.
@@ -17,8 +23,10 @@ export function reservePct(opts: {
   samples: { slot: number; loadKwh: number }[];
   safetyFactor: number;
   batteryKwh: number; // 42
+  floorPct?: number; // FoxESS minSocOnGrid; default / below-minimum -> 10
 }): number {
   const { nowSlot, samples, safetyFactor, batteryKwh } = opts;
+  const floor = Math.max(10, opts.floorPct ?? 10);
 
   const bySlot = new Map<number, { sum: number; n: number }>();
   for (const s of samples) {
@@ -38,6 +46,6 @@ export function reservePct(opts: {
     forecastKwh += agg ? agg.sum / agg.n : BOOTSTRAP_SLOT_KWH;
   }
 
-  const pct = Math.ceil(((forecastKwh * safetyFactor) / batteryKwh) * 100) + 10;
+  const pct = Math.ceil(((forecastKwh * safetyFactor) / batteryKwh) * 100) + floor;
   return Math.min(100, Math.max(10, pct));
 }

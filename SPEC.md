@@ -59,15 +59,25 @@ interfering"). The Tesla app start button is the escape hatch; no pause
 endpoint. Raising the car's charge limit is the "big drive tomorrow" knob.
 Session ownership is tracked in `sessions` (step 4 adds started_by).
 
-## State machine (ticks every 5 min, 05:30–14:15 Brisbane)
+## State machine (ticks every 5 min, 05:30–17:45 Brisbane)
 
-States: IDLE ⇄ DUMPING ⇄ SOLAR_TRACK → FREE_WINDOW → DONE. PLAN is the
+States: IDLE ⇄ DUMPING ⇄ SOLAR_TRACK → FREE_WINDOW → SOLAR_SOAK → DONE. PLAN is the
 first-tick-of-day event (creates the day's stored state), not a state.
 
 PLAN (first tick of day, ~05:30)
   reserve_kwh = forecast_house_load(now → 11:00) × safety_factor(1.3)
-  reserve_pct = clamp(ceil(reserve_kwh / 42 × 100) + 10 /*BMS floor*/, 10, 100)
-  Floor strategy (decided 2026-07-04, confirm with ~2 weeks of data): the
+  reserve_pct = clamp(ceil(reserve_kwh / 42 × 100) + floor, 10, 100)
+    where floor = max(10, minSocOnGrid read at PLAN; 10 if the read fails)
+  Reserve ON TOP of the floor (owner, 2026-09-27 — supersedes the
+  "effective reserve = max(forecast, floor)" rule and the floor-drift alert
+  below): the owner never wants the house on grid because the battery hit
+  its minimum. The inverter won't discharge below minSocOnGrid, so the
+  house's energy until 11:00 must sit above it, whatever the floor is. Every
+  floor ≥ 10% is therefore valid and there is no "floor too low" alert;
+  only a failed floor read alerts. With the floor at 10% this is exactly the
+  original formula. A floor read failure assumes 10%; if the real floor is
+  higher, the first import stop learns it (see SOLAR_TRACK "Learned floor").
+  Original floor strategy, SUPERSEDED where it conflicts with the above (decided 2026-07-04, confirm with ~2 weeks of data): the
   house load is flat (~0.4 kW), so reserve_pct is expected to be near-constant
   (~17–20%). Plan of record: the owner sets minSocOnGrid ONCE, manually, in
   the FoxESS app at step-5 go-live; the controller stays READ-ONLY on the
@@ -138,8 +148,32 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
     at 16 A with 6 kW PV: import ≈ 5.4 kW → step −9 → 7 A ≈ 4.8 kW ✓).
     Stop when clamped at 5 A AND import > 250 W (surplus can't sustain the
     car's minimum) → stop_charging. Worst case one tick ≈ 25 Wh of import.
+    Morning PV into the battery (2026-09-27): below the battery's reserve
+    Self-Use routes spare PV into the battery and feedin reads 0, so the
+    meter term alone never steps up. The loop uses
+    max(feedin_W − import_W, pv_W − load_W) — loadsPower includes the car,
+    so pv − load is PV left after house + car, i.e. what the battery is
+    absorbing. The larger of two non-import quantities cannot push the car
+    onto the grid; the 250 W margin covers the ~3% DC-vs-AC PV reading bias.
   While stopped:
-    Resume at 5 A only when the last 3 ticks (15 min) ALL showed
+    Solar bank (2026-09-27): resume at 5 A as soon as the energy above
+    reserve ((soc − reserve) × 420 Wh) covers max(0, 3.45 kW − (pv − load))
+    for 20 min — i.e. banked PV plus current sun can carry the car's
+    minimum for a full run. Previously banked PV reached the car only once
+    it hit reserve + 5% (≈ 2.1 kWh) and DUMPING re-entered at 16 A; on a
+    morning the owner leaves before 11:00, up to that much PV was left in
+    a battery that refills free at 11:00 anyway. Now at most ~1–4% is left
+    stranded, and the car runs gently at 5 A (amp loop above) until
+    reserve_hit. Learned floor (review fix, 2026-09-27): a below_solar_min
+    or sustained_import stop, or DUMPING's 8 kW import exit, raises the
+    day's reserve to the current SoC — import above the planned reserve
+    proves the battery won't discharge there (hardware floor above plan,
+    e.g. PLAN's floor read failed, or a derated battery). Without it the
+    bank restart saw "3% above reserve" and restarted onto paid grid every
+    tick until the cap. Only ever raises. Counts against the same 4-resume daily wear cap; past the
+    cap the reserve + 5 DUMPING re-entry still applies. Battery above
+    reserve covers any shortfall, so no import. Gated on solar_track.
+    Sun-only resume (unchanged): at 5 A only when the last 3 ticks (15 min) ALL showed
     pvPower − loadsPower ≥ 4.5 kW, capped at 4 solar resumes per day —
     past the cap stay stopped until FREE_WINDOW, log it. The 3-in-a-row
     rule gives dwell time and sustained-sun in one condition: flickering
@@ -183,10 +217,43 @@ FREE_WINDOW (11:00–14:00)
   (typically the KEPT native 11:00 Tesla schedule firing) is adopted as a
   system session — same goal, and adoption restores the 14:00 stop. Sticky
   pre-window owner sessions are untouched.
-  At 14:00: stop_charging unless car_soc < stranded_min (config, default 30%)
-  → in that case alert and leave charging (paid) — never strand the owner.
+  At 14:00: if car_soc < stranded_min (config, default 30%) → alert and
+  leave charging (paid) — never strand the owner — and go DONE. Otherwise
+  hand a system session to SOLAR_SOAK throttled to the visible PV
+  (set_amps, no contactor cycle), or stop_charging when solar_soak is off.
 
-DONE (post 14:00) → optional EVENING_DUMP if enabled in config: same as
+SOLAR_SOAK (14:00–17:30; added 2026-09-27)
+  Rationale (owner, 2026-09-27): the battery reaches 100% in the window, so
+  from 14:00 Self-Use CURTAILS the PV it can't place (export limited /
+  worth little — the paid 15 kWh/day is used by the 18:00 export). That PV
+  is free energy the car can take, and on low-battery mornings the window
+  alone doesn't fill the car.
+  Curtailment hides headroom from the meter (pv == load, feedin at its
+  cap), so the loop runs on the full battery as a buffer instead:
+    battery_W = feedin − import − (pv − load)   (energy balance, + = discharge)
+  using only variables already in the one real-time read (no new API
+  calls; batChargePower/batDischargePower deliberately not relied on).
+  While charging (system sessions only, invariant 6):
+    SoC < 90% → stop (soak_battery_low). Hard guard: the car may borrow at
+      most ~4 kWh, so the 18:00 export (no fdSoC floor) and the next
+      morning's dump are untouched.
+    battery_W > 300 → the car outran the sun: step down ceil(battery_W/690)
+      A, then hold 3 ticks before probing up again. Already at 5 A → stop
+      on the 2nd consecutive tick (soak_below_min; one tick rides out a
+      cloud, worst case ≈ 2 ticks × 3.45 kW from a full battery).
+    else take visible surplus max(feedin − import, pv − load) − 250 W in
+      one step; if none and the battery is full (≥ 97%, i.e. curtailing)
+      probe +1 A per tick — the inverter un-curtails to meet the load, or
+      the battery shows the shortfall next tick. A failed probe costs
+      ≈ 58 Wh from a full battery.
+  While stopped: start at 5 A when SoC ≥ 97%, before 16:30, ≥ 30 min after
+    the last soak stop, ≤ 3 starts per afternoon (wear), start not blocked
+    (an owner stop of a soak session stands down for the day as usual).
+  At 17:30 stop (soak_end) → DONE — well before the 18:00 export.
+  pvPower/feedinPower missing → alert once, stop, DONE (old 14:00 stop).
+  Config: solar_soak flag, default on; 'false' = the old 14:00 stop.
+
+DONE (post 17:30, or 14:00 with solar_soak off) → optional EVENING_DUMP if enabled in config: same as
 DUMPING but reserve horizon = house load until 11:00 TOMORROW. Off by
 default (trades overnight house autonomy for car charge).
 
@@ -221,15 +288,16 @@ default (trades overnight house autonomy for car charge).
   limit, 44096 "cannot update settings when schedule is active" — any future
   setting write must go through the scheduler endpoints while a schedule is
   enabled. Rate limit 1,440 calls/day (queries ≤ 1/s, writes ≤ 1 per 2 s).
-  Budget: 1 read per tick (~105/day) + nightly history pull. Ample headroom.
+  Budget: 1 read per tick (~147/day, 05:30–17:45) + nightly history pull.
+  Ample headroom.
 - ACTUAL scheduler config (owner-managed in the FoxESS app; the controller
   does not write it — verify-and-alert only):
     11:00–14:00 ForceCharge (free-window refill, as designed)
     18:00–21:00 ForceDischarge to grid, NO fdSoC floor — owner duration-tunes
                 it to export ~15 kWh (feed-in tariff pays well only on the
                 first 15 kWh/day); battery ends ~50% by 21:00
-    otherwise   Self-Use, minSocOnGrid currently 10% (owner raises it to the
-                static reserve, ~18–20%, at step-5 go-live)
+    otherwise   Self-Use, minSocOnGrid 10% (the old plan to raise it to the
+                reserve is dropped: the reserve now sits on top of it)
   The owner may manually skip the evening export before a long drive; that
   stays a manual FoxESS-app action (no calendar awareness).
 - Nightly job (LIVE since 2026-07-04, cron 0 15 * * * UTC = 01:00 Brisbane):
@@ -318,7 +386,8 @@ default (trades overnight house autonomy for car charge).
 ## Data model (D1)
 
 - config(key TEXT PK, value TEXT) — reserve safety factor, stranded_min,
-  evening_dump flag, solar_track flag (default on), shadow_mode flag
+  evening_dump flag, solar_track flag (default on), solar_soak flag
+  (default on), shadow_mode flag
   (default ON — commands only sent when explicitly 'false'), home_lat/
   home_lon (geofence), operating window
 - days(date TEXT PK, reserve_pct INT, planned_at TEXT, state TEXT)
@@ -337,6 +406,19 @@ default (trades overnight house autonomy for car charge).
   successful tick). Bounded cost. The kept native Tesla 11:00 schedule
   still delivers the free-window charge with zero working software.
 - FoxESS API down at PLAN: reuse yesterday's reserve; alert.
+- Grid offline (owner, 2026-09-27): no knowing when the house is
+  reconnected, so the battery is for the house only. The real-time read
+  also requests runningState (163 on-grid / 164 off-grid per community
+  docs — UNVERIFIED on this device, confirm via /debug/foxess; 164 is
+  also reported when the datalogger drops offline, when stopping is
+  still right). 164 → stop the system charge that tick, one alert, no
+  starts in any state until runningState reports anything else (then one
+  "back on-grid" note). Missing runningState never clears it. Fallback
+  (variable missing or not flipping): from 11:10 to 14:00 ForceCharge
+  should feed the car from the grid, so battery discharge (energy
+  balance, as SOLAR_SOAK) > 2 kW → same stop + alert, latched for the
+  day, since the stopped car hides the symptom. Owner sessions are never
+  stopped (invariant 6); the alert tells the owner to stop it in the app.
 - Tessie down: cannot start/stop car. House protected by floor. Alert.
 - Command accepted but car not charging: alert after 2 ticks.
 - Car plugged in away from home (work, supercharger, anywhere): geofence
@@ -344,7 +426,10 @@ default (trades overnight house autonomy for car charge).
 - Location missing from cached state: treated as away (fail-safe, no
   commands); alert once if persistent.
 - pvPower/feedinPower missing from real-time response: SOLAR_TRACK degrades
-  to stop-at-floor (old FLOOR_HOLD); alert once.
+  to stop-at-floor (old FLOOR_HOLD), SOLAR_SOAK to the old 14:00 stop;
+  alert once.
+- SOLAR_SOAK set_amps failing: the battery covers the car → soak_below_min
+  or, at worst, the 90% SoC hard stop; the inverter floor still backstops.
 - set_charging_amps fails mid-SOLAR_TRACK: import persists → next tick steps
   down again; if import > 2 kW for 3 consecutive ticks → stop_charging +
   alert (never sit on sustained paid import).
@@ -381,15 +466,17 @@ default (trades overnight house autonomy for car charge).
    all-days; all-days chosen — owner's load is flat). Sessions-table
    bookkeeping dropped: ownership lives in state_json, audit in decisions;
    the table stays for a future dashboard.
-5. ✅ DONE 2026-07-05 — */5 cron live, gated 05:30–14:15 in code. SHADOW
+5. ✅ DONE 2026-07-05 — */5 cron live, gated 05:30–14:15 in code (extended
+   to 17:45 on 2026-09-27 for SOLAR_SOAK). SHADOW
    MODE ON (config shadow_mode, default true — commands sent only when
    explicitly 'false'): decisions logged with "shadow:" prefix, no car
    commands, no ntfy from actions. Read-failure alerts throttled to one
    per 3 h (every failure still logged to decisions). PLAN verifies
    minSocOnGrid read-only via /op/v0/device/battery/soc/get (endpoint
    shape unverified — fails soft with an alert). GO-LIVE checklist after
-   the shadow week: review decisions log → owner raises minSocOnGrid to
-   the static reserve → set config shadow_mode='false'. The Tesla native
+   the shadow week: review decisions log → set config
+   shadow_mode='false'. (The "owner raises minSocOnGrid to the static
+   reserve" step was dropped 2026-09-27: the reserve sits on top of it.) The Tesla native
    11:00–14:00 schedule stays ON as the dead-controller backstop (adoption
    rule, see Tessie integration).
 6. Dashboard last (TanStack Start reading D1 via the Worker, or just

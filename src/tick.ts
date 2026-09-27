@@ -1,6 +1,7 @@
 import { reservePct } from "./reserve";
 import {
   AMP_STEP,
+  BANK_RUN_MINS,
   BATTERY_KWH,
   DERATE_IMPORT_W,
   EXPORT_MARGIN_W,
@@ -8,16 +9,28 @@ import {
   MAX_AMPS,
   MAX_SOLAR_RESUMES,
   MIN_AMPS,
+  OFF_GRID_RUNNING_STATE,
   RECOVER_IMPORT_W,
   RESERVE_BLEED_W,
   RESERVE_REFILL_PCT,
   RESUME_STREAK_TICKS,
   RESUME_SURPLUS_W,
+  SOAK_DISCHARGE_W,
+  SOAK_END_MINS,
+  SOAK_LAST_START_MINS,
+  SOAK_LOW_TICKS,
+  SOAK_MAX_STARTS,
+  SOAK_MIN_SOC,
+  SOAK_RESTART_HOLD_TICKS,
+  SOAK_START_SOC,
+  SOAK_STEP_HOLD_TICKS,
   START_CONFIRM_TICKS,
   STOP_IMPORT_W,
   SUSTAINED_IMPORT_TICKS,
   SUSTAINED_IMPORT_W,
   W_PER_AMP,
+  WINDOW_DRAIN_GRACE_MINS,
+  WINDOW_DRAIN_W,
   WINDOW_END_MINS,
   WINDOW_START_MINS,
 } from "./constants";
@@ -28,7 +41,7 @@ import {
  * Orchestration (reads, command execution, persistence) lives in src/index.ts.
  */
 
-export type StateName = "IDLE" | "DUMPING" | "SOLAR_TRACK" | "FREE_WINDOW" | "DONE";
+export type StateName = "IDLE" | "DUMPING" | "SOLAR_TRACK" | "FREE_WINDOW" | "SOLAR_SOAK" | "DONE";
 
 export interface StoredState {
   date: string; // YYYY-MM-DD Brisbane
@@ -48,7 +61,23 @@ export interface StoredState {
   manualNoted: boolean; // one ntfy per owner session
   solarVarsAlerted: boolean; // one ntfy per day for missing pv/feedin
   highImportTicks: number; // SOLAR_TRACK sustained-import failsafe
+  soakStarts: number; // SOLAR_SOAK starts today (wear cap)
+  soakHold: number; // SOLAR_SOAK ticks to wait before probing up / restarting
+  soakLowTicks: number; // SOLAR_SOAK consecutive ticks at MIN_AMPS with battery discharging
+  /** Grid-offline guard: "offgrid" = inverter reports off-grid (clears when it
+   *  reports anything else); "drain" = battery feeding the car in the free
+   *  window (latched for the day — the car being off hides the symptom). */
+  gridDown: "offgrid" | "drain" | null;
 }
+
+/** Fields added after go-live; a state row persisted by an older build lacks
+ *  them, so they are defaulted when the row is loaded mid-day. */
+const LATE_FIELDS: Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown"> = {
+  soakStarts: 0,
+  soakHold: 0,
+  soakLowTicks: 0,
+  gridDown: null,
+};
 
 export interface DecideInputs {
   date: string;
@@ -67,22 +96,24 @@ export interface DecideInputs {
     gridImportW: number;
     pvW: number | null; // null = inverter doesn't report it
     feedinW: number | null;
+    runningState?: number | null; // FoxESS mode code; absent = unknown
   };
   cfg: {
     safetyFactor: number;
     strandedMinPct: number;
     solarTrack: boolean;
+    solarSoak: boolean; // afternoon PV -> car after the window (default on)
     shadowMode: boolean;
   };
   /** Half-hour load history for PLAN; only read on the first tick of a day. */
   samples: { slot: number; loadKwh: number }[];
   /** FoxESS minSocOnGrid, read (read-only) at PLAN. 10% is the manufacturer
-   *  BMS minimum; the owner may raise it in the FoxESS app, and an owner-set
-   *  floor above the forecast reserve becomes the day's effective reserve —
-   *  so the software stops dumping AT the hardware floor instead of planning
-   *  through it (the inverter would stop discharging and the shortfall would
-   *  be paid grid import). null = read failed or not the first tick of a day;
-   *  falls back to the forecast reserve (hardware still enforces the floor). */
+   *  BMS minimum; the owner may raise it in the FoxESS app. The house's
+   *  forecast energy until 11:00 is reserved ON TOP of this floor — the
+   *  inverter won't discharge below it, so energy at/below the floor can't
+   *  run the house (it would be paid grid import). null = read failed or not
+   *  the first tick of a day; assumes the 10% minimum (hardware still
+   *  enforces the real floor, and an import stop learns it). */
   floorPct: number | null;
   stored: StoredState | null;
 }
@@ -99,21 +130,20 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   // PLAN: first tick of a new day.
   const s: StoredState =
     i.stored && i.stored.date === i.date
-      ? { ...i.stored }
+      ? { ...LATE_FIELDS, ...i.stored }
       : {
           date: i.date,
           state: "IDLE",
-          // Owner-raised hardware floor wins over the forecast (see
-          // DecideInputs.floorPct); the drift alert covers the other drift.
-          reservePct: Math.max(
-            reservePct({
-              nowSlot: Math.floor(i.nowMins / 30),
-              samples: i.samples,
-              safetyFactor: i.cfg.safetyFactor,
-              batteryKwh: BATTERY_KWH,
-            }),
-            i.floorPct ?? 0,
-          ),
+          // House energy until 11:00 on top of the hardware floor (see
+          // DecideInputs.floorPct). Floor unknown -> 10% BMS minimum; the
+          // learned-floor rule catches a higher one from import evidence.
+          reservePct: reservePct({
+            nowSlot: Math.floor(i.nowMins / 30),
+            samples: i.samples,
+            safetyFactor: i.cfg.safetyFactor,
+            batteryKwh: BATTERY_KWH,
+            floorPct: i.floorPct ?? undefined,
+          }),
           sessionOwner: null,
           startPending: -1,
           startBlocked: false,
@@ -123,6 +153,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           manualNoted: false,
           solarVarsAlerted: false,
           highImportTicks: 0,
+          ...LATE_FIELDS,
         };
 
   const charging = i.car.chargingState === "Charging";
@@ -139,7 +170,16 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     s.startPending = 0;
     s.lastAmps = amps;
   };
-  const canStart = () => !s.startBlocked && s.startPending < 0;
+  const canStart = () => !s.startBlocked && s.startPending < 0 && s.gridDown === null;
+  // Grid import while the car runs above reserve means the battery would not
+  // discharge at this SoC (hardware floor above the planned reserve — e.g. the
+  // PLAN floor read failed — or a derated battery). Adopt that SoC as today's
+  // effective reserve so no path (bank restart, reserve + 5 re-entry) starts
+  // the car on paid grid again. Only ever raises: conservative, like the
+  // owner-raised-floor rule at PLAN.
+  const learnFloor = () => {
+    s.reservePct = Math.min(100, Math.max(s.reservePct, i.house.socPct));
+  };
 
   // --- Session bookkeeping (invariants 4 + 6) ---
   if (charging && s.sessionOwner === null) {
@@ -188,6 +228,41 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     s.manualNoted = false; // next manual session gets its own note
   }
 
+  // --- Grid-offline guard (owner, 2026-09-27) ---
+  // Without the grid there's no knowing when the house is reconnected, so the
+  // house battery is for the house only: stop our charge at once and start
+  // nothing until the grid is back.
+  const rs = i.house.runningState;
+  const wasDown = s.gridDown;
+  if (rs === OFF_GRID_RUNNING_STATE) {
+    if (s.gridDown === null) s.gridDown = "offgrid";
+  } else if (s.gridDown === "offgrid" && rs !== null && rs !== undefined) {
+    s.gridDown = null;
+    a.push({ kind: "notify", message: `inverter back on-grid (runningState ${rs}) — car charging resumes normally` });
+  }
+  if (
+    s.gridDown === null &&
+    i.nowMins >= WINDOW_START_MINS + WINDOW_DRAIN_GRACE_MINS &&
+    i.nowMins < WINDOW_END_MINS &&
+    i.house.pvW !== null &&
+    i.house.feedinW !== null &&
+    i.house.feedinW - i.house.gridImportW - (i.house.pvW - i.house.loadW) > WINDOW_DRAIN_W
+  ) {
+    s.gridDown = "drain"; // fallback when runningState is missing or doesn't flip
+  }
+  if (s.gridDown !== null && wasDown === null) {
+    const why =
+      s.gridDown === "offgrid"
+        ? `inverter reports off-grid (runningState ${rs})`
+        : "house battery discharging in the free window (grid down or ForceCharge not running)";
+    const owner = s.sessionOwner === "owner" && charging ? " An owner-started charge is still running — stop it in the Tesla app." : "";
+    const until = s.gridDown === "offgrid" ? "until it's back on-grid" : "for the rest of today";
+    a.push({ kind: "notify", message: `${why}: car charging stopped, no starts ${until}.${owner}` });
+  }
+  if (s.gridDown !== null && charging && s.sessionOwner === "system" && i.car.atHome) {
+    stop("grid_offline");
+  }
+
   // No command ever leaves while away/unknown (invariant 7) or during an
   // owner session (invariant 6).
   const canAct = i.car.atHome && s.sessionOwner !== "owner";
@@ -202,7 +277,9 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   const phase = i.nowMins >= WINDOW_END_MINS ? "after" : i.nowMins >= WINDOW_START_MINS ? "window" : "morning";
 
   if (phase === "after") {
-    if (s.state !== "DONE") {
+    const soakOn = i.cfg.solarSoak && i.nowMins < SOAK_END_MINS;
+    if (s.state !== "DONE" && s.state !== "SOLAR_SOAK") {
+      // First after-window tick (or a re-plug after an unplug reset to IDLE).
       if (charging && s.sessionOwner === "system" && canAct) {
         if (i.car.socPct < i.cfg.strandedMinPct) {
           // never strand the owner: leave the (now paid) charge running
@@ -210,12 +287,24 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
             kind: "notify",
             message: `free window ended with car at ${i.car.socPct}% (< stranded min ${i.cfg.strandedMinPct}%) — leaving paid charge running`,
           });
-        } else {
-          stop("window_end");
+          s.state = "DONE";
+          return { actions: a, next: s };
         }
+        if (soakOn && !full && i.house.pvW !== null && i.house.feedinW !== null) {
+          // Throttle to the PV the meter can see instead of stopping: no
+          // contactor cycle, and the soak loop probes up from here.
+          const houseW = i.house.loadW - i.car.chargeAmps * W_PER_AMP;
+          const target = clampAmps(Math.floor((i.house.pvW - houseW - EXPORT_MARGIN_W) / W_PER_AMP));
+          if (target !== s.lastAmps) a.push({ kind: "set_amps", amps: target });
+          s.lastAmps = target;
+          s.state = "SOLAR_SOAK";
+          return { actions: a, next: s };
+        }
+        stop("window_end");
       }
-      s.state = "DONE";
+      s.state = soakOn ? "SOLAR_SOAK" : "DONE";
     }
+    if (s.state === "SOLAR_SOAK") soak(i, s, a, { charging, full, canAct, stop, start, canStart, soakOn });
     return { actions: a, next: s };
   }
 
@@ -245,7 +334,12 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   } else if (st === "IDLE") {
     st = i.house.socPct > s.reservePct ? "DUMPING" : "SOLAR_TRACK";
   } else if (st === "DUMPING") {
-    if (i.house.socPct <= s.reservePct || i.house.gridImportW > FLOOR_IMPORT_W) st = "SOLAR_TRACK";
+    if (i.house.gridImportW > FLOOR_IMPORT_W) {
+      learnFloor(); // floor hit before a SoC read caught it: reserve_hit stops the car this tick
+      st = "SOLAR_TRACK";
+    } else if (i.house.socPct <= s.reservePct) {
+      st = "SOLAR_TRACK";
+    }
   } else if (st === "SOLAR_TRACK") {
     if (i.house.socPct > s.reservePct + RESERVE_REFILL_PCT) st = "DUMPING"; // PV refilled the battery: recover it at full rate
   }
@@ -292,6 +386,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
         if (i.house.gridImportW > SUSTAINED_IMPORT_W) {
           if (++s.highImportTicks >= SUSTAINED_IMPORT_TICKS) {
             stop("sustained_import");
+            learnFloor();
             a.push({ kind: "notify", message: "SOLAR_TRACK: sustained grid import — stopped charge" });
             s.highImportTicks = 0;
           }
@@ -299,11 +394,18 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           s.highImportTicks = 0;
         }
         if (s.sessionOwner === "system") {
-          // closed loop on the meter; floor() + margin bias errors toward export
-          const delta = Math.floor((i.house.feedinW! - i.house.gridImportW - EXPORT_MARGIN_W) / W_PER_AMP);
+          // Closed loop on the meter; floor() + margin bias errors toward
+          // export. Below the battery's own reserve Self-Use routes spare PV
+          // into the battery and the meter reads ~0, so PV beyond house+car
+          // (loadW includes the car) also counts: the car follows the sun
+          // instead of the battery soaking it up. The larger of the two is
+          // never import-side, so this cannot push the car onto paid grid.
+          const surplusW = Math.max(i.house.feedinW! - i.house.gridImportW, i.house.pvW! - i.house.loadW);
+          const delta = Math.floor((surplusW - EXPORT_MARGIN_W) / W_PER_AMP);
           const target = Math.min(MAX_AMPS, Math.max(MIN_AMPS, s.lastAmps + delta));
           if (target === MIN_AMPS && s.lastAmps === MIN_AMPS && i.house.gridImportW > STOP_IMPORT_W) {
             stop("below_solar_min"); // surplus can't sustain the car's 3.45 kW minimum
+            learnFloor();
           } else if (target !== s.lastAmps) {
             a.push({ kind: "set_amps", amps: target });
             s.lastAmps = target;
@@ -314,7 +416,21 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       // resume throttle: 15 min of sustained surplus, capped per day (wear)
       const surplus = i.cfg.solarTrack && i.house.pvW !== null ? i.house.pvW - i.house.loadW : 0;
       s.surplusStreak = surplus >= RESUME_SURPLUS_W ? s.surplusStreak + 1 : 0;
-      if (s.surplusStreak >= RESUME_STREAK_TICKS && s.solarResumes < MAX_SOLAR_RESUMES && canStart()) {
+      // Solar bank: PV the battery absorbed above reserve (loadsPower is
+      // house-only while the car is off). Resume as soon as that bank plus
+      // today's surplus carries the car's minimum for BANK_RUN_MINS, rather
+      // than waiting for reserve + RESERVE_REFILL_PCT — less morning PV is
+      // left stranded in the battery when the owner drives off, and the run
+      // ends at reserve via reserve_hit (battery above reserve covers any
+      // shortfall, so no import).
+      const bankWh = (i.house.socPct - s.reservePct) * BATTERY_KWH * 10;
+      const needWh = (Math.max(0, MIN_AMPS * W_PER_AMP - surplus) * BANK_RUN_MINS) / 60;
+      const banked = i.cfg.solarTrack && bankWh > 0 && bankWh >= needWh;
+      if (
+        (s.surplusStreak >= RESUME_STREAK_TICKS || banked) &&
+        s.solarResumes < MAX_SOLAR_RESUMES &&
+        canStart()
+      ) {
         s.surplusStreak = 0;
         s.solarResumes++;
         start(MIN_AMPS);
@@ -323,4 +439,98 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   }
 
   return { actions: a, next: s };
+}
+
+const clampAmps = (a: number) => Math.min(MAX_AMPS, Math.max(MIN_AMPS, a));
+
+/**
+ * SOLAR_SOAK (after the free window, see SPEC): the battery is full and
+ * Self-Use curtails the PV it can't place, so the car soaks it up. The meter
+ * can't see curtailed headroom, so the loop runs on the battery instead:
+ *   batteryW = feedin - import - (pv - load)   (energy balance, + = discharging)
+ * Discharging -> the car outran the sun: step down. Otherwise take visible
+ * surplus (export, or PV into the battery), and while the battery is full
+ * probe up 1 A per tick — the inverter un-curtails to meet the new load, or
+ * the battery shows it next tick. The full battery is only a buffer:
+ * SOAK_MIN_SOC is the hard stop, so the evening export and next morning's
+ * dump are untouched.
+ */
+function soak(
+  i: DecideInputs,
+  s: StoredState,
+  a: Action[],
+  h: {
+    charging: boolean;
+    full: boolean;
+    canAct: boolean;
+    soakOn: boolean;
+    stop: (reason: string) => void;
+    start: (amps: number) => void;
+    canStart: () => boolean;
+  },
+): void {
+  const own = h.charging && s.sessionOwner === "system";
+  if (!h.soakOn) {
+    if (own && h.canAct) h.stop("soak_end");
+    s.state = "DONE";
+    return;
+  }
+  if (!h.canAct || h.full) return;
+  if (i.house.pvW === null || i.house.feedinW === null) {
+    if (!s.solarVarsAlerted) {
+      a.push({ kind: "notify", message: "pvPower/feedinPower missing — afternoon solar soak disabled" });
+      s.solarVarsAlerted = true;
+    }
+    if (own) h.stop("solar_vars_missing");
+    s.state = "DONE";
+    return;
+  }
+  if (s.soakHold > 0) s.soakHold--;
+  const spareW = i.house.pvW - i.house.loadW; // PV beyond house + car
+  const batteryW = i.house.feedinW - i.house.gridImportW - spareW;
+
+  if (own) {
+    if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+    const stopSoak = (reason: string) => {
+      h.stop(reason);
+      s.soakHold = SOAK_RESTART_HOLD_TICKS;
+      s.soakLowTicks = 0;
+    };
+    if (i.house.socPct < SOAK_MIN_SOC) {
+      stopSoak("soak_battery_low");
+    } else if (batteryW > SOAK_DISCHARGE_W) {
+      if (s.lastAmps <= MIN_AMPS) {
+        if (++s.soakLowTicks >= SOAK_LOW_TICKS) stopSoak("soak_below_min");
+      } else {
+        s.soakLowTicks = 0;
+        const target = clampAmps(s.lastAmps - Math.ceil(batteryW / W_PER_AMP));
+        a.push({ kind: "set_amps", amps: target });
+        s.lastAmps = target;
+        s.soakHold = SOAK_STEP_HOLD_TICKS;
+      }
+    } else {
+      s.soakLowTicks = 0;
+      const visibleW = Math.max(i.house.feedinW - i.house.gridImportW, spareW);
+      let target = s.lastAmps + Math.max(0, Math.floor((visibleW - EXPORT_MARGIN_W) / W_PER_AMP));
+      if (target === s.lastAmps && s.soakHold === 0 && i.house.socPct >= SOAK_START_SOC) target++; // probe
+      target = clampAmps(target);
+      if (target !== s.lastAmps) {
+        a.push({ kind: "set_amps", amps: target });
+        s.lastAmps = target;
+      }
+    }
+  } else if (
+    !h.charging &&
+    i.house.socPct >= SOAK_START_SOC &&
+    i.nowMins < SOAK_LAST_START_MINS &&
+    s.soakHold === 0 &&
+    s.soakStarts < SOAK_MAX_STARTS &&
+    h.canStart()
+  ) {
+    // Full battery = PV is (probably) being curtailed. A failed probe costs
+    // at most SOAK_LOW_TICKS of the car's minimum from a full battery.
+    s.soakStarts++;
+    s.soakLowTicks = 0;
+    h.start(MIN_AMPS);
+  }
 }

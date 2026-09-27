@@ -4,7 +4,7 @@
   "compatibility_date": "2026-06-01",
   "triggers": {
     // 15:00 UTC = 01:00 Brisbane: nightly pull of yesterday's load history.
-    // */5: the tick state machine, gated in code to 05:30-14:15 Brisbane.
+    // */5: the tick state machine, gated in code to 05:30-17:45 Brisbane.
     // Shadow mode (config.shadow_mode, default true) logs decisions without
     // sending car commands; flip to 'false' after the shadow week.
     "crons": ["0 15 * * *", "*/5 * * * *"]
