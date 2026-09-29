@@ -59,7 +59,6 @@ export const MAX_SOLAR_RESUMES = 4; // contactor-wear cap per day
 export const RESERVE_BLEED_W = 250; // at/below reserve: load beyond pv+this = battery/grid feeding the car
 export const SUSTAINED_IMPORT_W = 2000; // SOLAR_TRACK failsafe (amp commands failing)
 export const SUSTAINED_IMPORT_TICKS = 3;
-export const RESERVE_REFILL_PCT = 5; // SOLAR_TRACK -> DUMPING once SoC > reserve + this
 export const START_CONFIRM_TICKS = 2; // invariant 4: ticks to see "Charging" after a start
 
 // --- Grid-offline guard (src/tick.ts) ---
@@ -78,6 +77,9 @@ export const WINDOW_DRAIN_GRACE_MINS = 10;
 /** Resume at MIN_AMPS once the energy banked above reserve plus the current
  *  PV surplus can carry the car's minimum for this long. */
 export const BANK_RUN_MINS = 20;
+/** Glide: spend the bank above the reserve over (minutes to 11:00 + this),
+ *  so the final tick before the window can't overshoot into the floor. */
+export const GLIDE_BUFFER_MINS = 5;
 
 // --- Afternoon solar soak (SOLAR_SOAK, src/tick.ts) ---
 // After 14:00 the battery is full and Self-Use curtails the PV it can't

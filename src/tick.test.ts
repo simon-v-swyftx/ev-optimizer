@@ -22,6 +22,8 @@ function stored(over: Partial<StoredState> = {}): StoredState {
     date: "2026-07-06",
     state: "IDLE",
     reservePct: 17,
+    floorPct: 10,
+    slotKwh: null, // legacy fixed reserve unless a test opts into decay
     sessionOwner: null,
     startPending: -1,
     startBlocked: false,
@@ -248,7 +250,7 @@ describe("SOLAR_TRACK", () => {
     expect(kinds(decide(i).actions)).not.toContain("stop_charging");
   });
 
-  it("resumes at 5 A only after 3 consecutive surplus ticks", () => {
+  it("resumes only after 3 consecutive surplus ticks, at the amps the sun supports", () => {
     let st = stored({ state: "SOLAR_TRACK" });
     for (const expectStart of [false, false, true]) {
       const i = solar({ pvW: 5200 }, st);
@@ -257,7 +259,7 @@ describe("SOLAR_TRACK", () => {
       st = next;
     }
     expect(st.solarResumes).toBe(1);
-    expect(st.lastAmps).toBe(5);
+    expect(st.lastAmps).toBe(6); // floor((5200 - 400 - 250) / 690)
   });
 
   it("a cloudy tick resets the resume streak", () => {
@@ -366,14 +368,126 @@ describe("SOLAR_TRACK", () => {
     expect(decide(i).next.reservePct).toBe(25);
   });
 
-  it("bounces back to DUMPING when PV lifts the battery over reserve + 5", () => {
-    const i = solar({ socPct: 23 }); // reserve 17 -> 23 > 22
-    expect(decide(i).next.state).toBe("DUMPING");
+  it("PV refill well above reserve glides instead of a 16 A DUMPING burst", () => {
+    const i = solar({ socPct: 23, pvW: 1000 }); // reserve 17
+    const { actions, next } = decide(i);
+    expect(next.state).toBe("SOLAR_TRACK");
+    // 06:00: bank 6% = 2520 Wh over (300 + 5) min = 496 W; 1000 - 400 + 496 - 250 = 846 W -> 5 A
+    expect(actions).toEqual([{ kind: "start_charging", amps: 5 }]);
+  });
+});
+
+describe("decaying reserve + glide to 11:00 (2026-09-29)", () => {
+  // flat 0.2 kWh/half-hour house (0.4 kW), 10% floor
+  const FLAT = Array.from({ length: 22 }, () => 0.2);
+  const glide = (nowMins: number, house: Partial<DecideInputs["house"]>, st: Partial<StoredState> = {}) => {
+    const i = base();
+    i.nowMins = nowMins;
+    i.house = { socPct: 14, loadW: 400, gridImportW: 0, pvW: 1000, feedinW: 0, ...house };
+    i.stored = stored({ state: "SOLAR_TRACK", slotKwh: FLAT, ...st });
+    return i;
+  };
+
+  it("PLAN stores the forecast and floor; reserve equals the old formula at a slot boundary", () => {
+    const i = base(); // 06:00
+    for (let slot = 12; slot < 22; slot++) i.samples.push({ slot, loadKwh: 0.2 });
+    i.floorPct = 12;
+    const { next } = decide(i);
+    expect(next.floorPct).toBe(12);
+    expect(next.slotKwh).toHaveLength(22);
+    expect(next.reservePct).toBe(19); // 2.0 kWh x 1.3 / 42 -> ceil 7 + 12
   });
 
-  it("stays SOLAR_TRACK at reserve + 5 exactly", () => {
-    const i = solar({ socPct: 22 });
-    expect(decide(i).next.state).toBe("SOLAR_TRACK");
+  it("the reserve decays through the morning to the floor at 11:00", () => {
+    const at = (m: number) => decide(glide(m, { socPct: 50 })).next.reservePct;
+    expect(at(6 * 60)).toBe(17); // 2.0 kWh left
+    expect(at(9 * 60)).toBe(13); // 0.8 kWh left
+    expect(at(10 * 60 + 45)).toBe(11); // 0.1 kWh left
+  });
+
+  it("owner's case: 10:45, battery above the decayed reserve, starts charging", () => {
+    // SoC 14 vs 17 at PLAN (old: stuck) vs 11 now: 3% = 1260 Wh banked.
+    // Needs (3450 - 600) x 15 min = 712 Wh to run until 11:00 -> starts.
+    const { actions, next } = decide(glide(10 * 60 + 45, {}));
+    expect(kinds(actions)).toEqual(["start_charging"]);
+    expect(next.reservePct).toBe(11);
+  });
+
+  it("the same battery at 07:00 stays put (the house still needs it)", () => {
+    const { actions, next } = decide(glide(7 * 60, {}));
+    expect(next.reservePct).toBe(15); // 1.6 kWh left x 1.3 -> 5% + 10
+    expect(actions).toHaveLength(0);
+  });
+
+  it("glide rate spreads the bank to 11:00: gentle early, faster late", () => {
+    // charging at 5 A, battery covering the gap (meter 0, pv < load)
+    const run = (m: number, soc: number) => {
+      const i = glide(m, { socPct: soc, loadW: 3850, pvW: 1500 }, { sessionOwner: "system", lastAmps: 5 });
+      i.car.chargingState = "Charging";
+      return decide(i).actions;
+    };
+    // 08:00, SoC 25, reserve 14: 4620 Wh over 185 min = 1498 W allowance, but the
+    // battery already covers 2350 W -> 1498 - 2350 - 250 < 0 -> stays 5 A (no ratchet)
+    expect(run(8 * 60, 25)).toHaveLength(0);
+    // 10:30, SoC 25, reserve 11: 5880 Wh over 35 min = 10080 W -> 10080 - 2350 - 250 = 7480 -> +10 A = 15 A
+    expect(run(10 * 60 + 30, 25)).toEqual([{ kind: "set_amps", amps: 15 }]);
+  });
+
+  it("keeps the morning dump at 16 A (unchanged)", () => {
+    const i = glide(6 * 60, { socPct: 44 }, { state: "IDLE" });
+    const { actions, next } = decide(i);
+    expect(next.state).toBe("DUMPING");
+    expect(actions).toEqual([{ kind: "start_charging", amps: 16 }]);
+  });
+
+  it("learned floor lifts the whole decaying curve", () => {
+    const i = glide(
+      9 * 60,
+      { socPct: 30, loadW: 3850, pvW: 1000, gridImportW: 2850 },
+      { sessionOwner: "system", lastAmps: 5, reservePct: 13 },
+    );
+    i.car.chargingState = "Charging";
+    const { actions, next } = decide(i);
+    expect(actions).toContainEqual({ kind: "stop_charging", reason: "below_solar_min" });
+    expect(next.floorPct).toBe(30);
+    expect(next.reservePct).toBe(33); // 30 + house need until 11:00
+  });
+
+  it("simulated 09:00 -> 11:00: spends the bank into the car without breaching the reserve", () => {
+    // Plant: house 400 W, PV 1.2 kW, battery covers the rest (Self-Use, no import
+    // while SoC > 10% floor). SoC tracked in Wh; the controller sees whole %.
+    let wh = 22 * 420; // 22% at 09:00
+    let st = stored({ state: "SOLAR_TRACK", slotKwh: FLAT });
+    let carOn = false;
+    let amps = 0;
+    let carWh = 0;
+    let minMargin = Infinity;
+    for (let m = 9 * 60; m < 11 * 60; m += 5) {
+      const carW = carOn ? amps * 690 : 0;
+      const i = glide(m, { socPct: Math.floor(wh / 420), loadW: 400 + carW, pvW: 1200 }, st);
+      i.car.chargingState = carOn ? "Charging" : "Stopped";
+      i.car.chargeAmps = amps;
+      const r = decide(i);
+      for (const act of r.actions) {
+        if (act.kind === "start_charging") [carOn, amps] = [true, act.amps];
+        if (act.kind === "set_amps") amps = act.amps;
+        if (act.kind === "stop_charging") carOn = false;
+      }
+      st = r.next;
+      minMargin = Math.min(minMargin, wh / 420 - (st.reservePct - 1)); // ceil() slack: 1 point
+      const drawW = 400 + (carOn ? amps * 690 : 0) - 1200;
+      wh -= (drawW * 5) / 60;
+      carWh += ((carOn ? amps * 690 : 0) * 5) / 60;
+      expect(wh / 420).toBeGreaterThan(10); // never reaches the hardware floor -> no import
+    }
+    expect(minMargin).toBeGreaterThan(-1); // never meaningfully below the reserve line
+    expect(wh / 420).toBeLessThan(14); // bank actually spent, not stranded at 11:00
+    expect(carWh).toBeGreaterThan(4000); // ~4.6 kWh into the car over two hours
+  });
+
+  it("a legacy stored row (no forecast) keeps its fixed reserve", () => {
+    const { next } = decide(glide(10 * 60 + 45, {}, { slotKwh: null, reservePct: 17 }));
+    expect(next.reservePct).toBe(17);
   });
 });
 

@@ -16,7 +16,8 @@ and relies on one static, owner-set FoxESS floor (`minSocOnGrid`, read-only,
 once at PLAN) as the hardware backstop. The house's forecast energy until
 11:00 is reserved ON TOP of that floor (10% BMS minimum unless the owner
 raised it), so the house never runs on grid because the battery hit its
-minimum.
+minimum. That reserve decays through the morning as the house uses its
+need, and anything above it glides into the car by 11:00.
 
 ## Hardware facts (constants, do not guess)
 

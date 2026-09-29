@@ -1,4 +1,4 @@
-import { reservePct } from "./reserve";
+import { morningSlotKwh, reserveAt } from "./reserve";
 import {
   AMP_STEP,
   BANK_RUN_MINS,
@@ -6,13 +6,13 @@ import {
   DERATE_IMPORT_W,
   EXPORT_MARGIN_W,
   FLOOR_IMPORT_W,
+  GLIDE_BUFFER_MINS,
   MAX_AMPS,
   MAX_SOLAR_RESUMES,
   MIN_AMPS,
   OFF_GRID_RUNNING_STATE,
   RECOVER_IMPORT_W,
   RESERVE_BLEED_W,
-  RESERVE_REFILL_PCT,
   RESUME_STREAK_TICKS,
   RESUME_SURPLUS_W,
   SOAK_DISCHARGE_W,
@@ -46,7 +46,15 @@ export type StateName = "IDLE" | "DUMPING" | "SOLAR_TRACK" | "FREE_WINDOW" | "SO
 export interface StoredState {
   date: string; // YYYY-MM-DD Brisbane
   state: StateName;
+  /** House reserve NOW: floorPct + forecast house need until 11:00. Re-derived
+   *  every tick from slotKwh, so it decays through the morning. */
   reservePct: number;
+  /** Effective hardware floor: max(10, minSocOnGrid at PLAN, learned from
+   *  import stops). */
+  floorPct: number;
+  /** Forecast house kWh per half-hour slot until 11:00, fixed at PLAN.
+   *  null = row persisted before the decaying reserve: reservePct stays fixed. */
+  slotKwh: number[] | null;
   /** Who started the running charge session (invariant 6). */
   sessionOwner: "system" | "owner" | null;
   /** Ticks since start_charging was sent; -1 = no start pending (invariant 4). */
@@ -72,7 +80,12 @@ export interface StoredState {
 
 /** Fields added after go-live; a state row persisted by an older build lacks
  *  them, so they are defaulted when the row is loaded mid-day. */
-const LATE_FIELDS: Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown"> = {
+const LATE_FIELDS: Pick<
+  StoredState,
+  "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown" | "floorPct" | "slotKwh"
+> = {
+  floorPct: 10,
+  slotKwh: null,
   soakStarts: 0,
   soakHold: 0,
   soakLowTicks: 0,
@@ -137,13 +150,8 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           // House energy until 11:00 on top of the hardware floor (see
           // DecideInputs.floorPct). Floor unknown -> 10% BMS minimum; the
           // learned-floor rule catches a higher one from import evidence.
-          reservePct: reservePct({
-            nowSlot: Math.floor(i.nowMins / 30),
-            samples: i.samples,
-            safetyFactor: i.cfg.safetyFactor,
-            batteryKwh: BATTERY_KWH,
-            floorPct: i.floorPct ?? undefined,
-          }),
+          // reservePct is filled in by refreshReserve() below.
+          reservePct: 0,
           sessionOwner: null,
           startPending: -1,
           startBlocked: false,
@@ -154,7 +162,21 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           solarVarsAlerted: false,
           highImportTicks: 0,
           ...LATE_FIELDS,
+          floorPct: Math.max(10, i.floorPct ?? 10),
+          slotKwh: morningSlotKwh(i.samples),
         };
+
+  const refreshReserve = () => {
+    if (s.slotKwh === null) return; // legacy row: keep its fixed reserve
+    s.reservePct = reserveAt({
+      nowMins: i.nowMins,
+      slotKwh: s.slotKwh,
+      safetyFactor: i.cfg.safetyFactor,
+      batteryKwh: BATTERY_KWH,
+      floorPct: s.floorPct,
+    });
+  };
+  refreshReserve();
 
   const charging = i.car.chargingState === "Charging";
   const full = i.car.chargingState === "Complete" || i.car.socPct >= i.car.limitPct;
@@ -174,11 +196,13 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   // Grid import while the car runs above reserve means the battery would not
   // discharge at this SoC (hardware floor above the planned reserve — e.g. the
   // PLAN floor read failed — or a derated battery). Adopt that SoC as today's
-  // effective reserve so no path (bank restart, reserve + 5 re-entry) starts
+  // effective floor so no path (bank restart, glide) starts
   // the car on paid grid again. Only ever raises: conservative, like the
   // owner-raised-floor rule at PLAN.
   const learnFloor = () => {
-    s.reservePct = Math.min(100, Math.max(s.reservePct, i.house.socPct));
+    s.floorPct = Math.min(100, Math.max(s.floorPct, i.house.socPct));
+    if (s.slotKwh === null) s.reservePct = Math.min(100, Math.max(s.reservePct, i.house.socPct));
+    else refreshReserve(); // the house's remaining need now sits on the learned floor
   };
 
   // --- Session bookkeeping (invariants 4 + 6) ---
@@ -340,9 +364,10 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     } else if (i.house.socPct <= s.reservePct) {
       st = "SOLAR_TRACK";
     }
-  } else if (st === "SOLAR_TRACK") {
-    if (i.house.socPct > s.reservePct + RESERVE_REFILL_PCT) st = "DUMPING"; // PV refilled the battery: recover it at full rate
   }
+  // No SOLAR_TRACK -> DUMPING re-entry any more (2026-09-29): energy that
+  // appears above the reserve (PV, or the reserve decaying toward 11:00) is
+  // glided into the car at a gentle rate instead of a 16 A burst.
   s.state = st;
 
   if (st === "DUMPING" && canAct) {
@@ -365,6 +390,12 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
 
   if (st === "SOLAR_TRACK" && canAct) {
     const varsOk = i.house.pvW !== null && i.house.feedinW !== null;
+    // Glide (2026-09-29): spread the battery's energy above the reserve
+    // evenly until 11:00, on top of the PV, instead of leaving it idle for
+    // the free refill. One tick of buffer so the last tick doesn't overshoot.
+    const minsLeft = WINDOW_START_MINS - i.nowMins;
+    const bankWh = (i.house.socPct - s.reservePct) * BATTERY_KWH * 10;
+    const spendW = Math.max(0, bankWh) / ((minsLeft + GLIDE_BUFFER_MINS) / 60);
     if (!varsOk) {
       // degrade to floor-hold: stop, wait for the free window (SPEC fallback)
       if (!s.solarVarsAlerted) {
@@ -400,8 +431,13 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           // (loadW includes the car) also counts: the car follows the sun
           // instead of the battery soaking it up. The larger of the two is
           // never import-side, so this cannot push the car onto paid grid.
+          // Plus the glide allowance: the battery may cover up to spendW, net
+          // of what it is ALREADY discharging (energy balance, as SOLAR_SOAK)
+          // — the meter can't see that drain, so without subtracting it the
+          // allowance would ratchet the amps up every tick.
           const surplusW = Math.max(i.house.feedinW! - i.house.gridImportW, i.house.pvW! - i.house.loadW);
-          const delta = Math.floor((surplusW - EXPORT_MARGIN_W) / W_PER_AMP);
+          const dischargeW = Math.max(0, i.house.feedinW! - i.house.gridImportW - (i.house.pvW! - i.house.loadW));
+          const delta = Math.floor((surplusW + spendW - dischargeW - EXPORT_MARGIN_W) / W_PER_AMP);
           const target = Math.min(MAX_AMPS, Math.max(MIN_AMPS, s.lastAmps + delta));
           if (target === MIN_AMPS && s.lastAmps === MIN_AMPS && i.house.gridImportW > STOP_IMPORT_W) {
             stop("below_solar_min"); // surplus can't sustain the car's 3.45 kW minimum
@@ -419,12 +455,14 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       // Solar bank: PV the battery absorbed above reserve (loadsPower is
       // house-only while the car is off). Resume as soon as that bank plus
       // today's surplus carries the car's minimum for BANK_RUN_MINS, rather
-      // than waiting for reserve + RESERVE_REFILL_PCT — less morning PV is
+      // than waiting for a big refill — less morning PV is
       // left stranded in the battery when the owner drives off, and the run
       // ends at reserve via reserve_hit (battery above reserve covers any
       // shortfall, so no import).
-      const bankWh = (i.house.socPct - s.reservePct) * BATTERY_KWH * 10;
-      const needWh = (Math.max(0, MIN_AMPS * W_PER_AMP - surplus) * BANK_RUN_MINS) / 60;
+      // Close to 11:00 the run only has to last until the window, where the
+      // car keeps charging free without a contactor cycle.
+      const runMins = Math.min(BANK_RUN_MINS, minsLeft);
+      const needWh = (Math.max(0, MIN_AMPS * W_PER_AMP - surplus) * runMins) / 60;
       const banked = i.cfg.solarTrack && bankWh > 0 && bankWh >= needWh;
       if (
         (s.surplusStreak >= RESUME_STREAK_TICKS || banked) &&
@@ -433,7 +471,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       ) {
         s.surplusStreak = 0;
         s.solarResumes++;
-        start(MIN_AMPS);
+        start(clampAmps(Math.floor((surplus + spendW - EXPORT_MARGIN_W) / W_PER_AMP)));
       }
     }
   }
