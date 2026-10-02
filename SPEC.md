@@ -77,6 +77,14 @@ PLAN (first tick of day, ~05:30)
   only a failed floor read alerts. With the floor at 10% this is exactly the
   original formula. A floor read failure assumes 10%; if the real floor is
   higher, the first import stop learns it (see SOLAR_TRACK "Learned floor").
+  Decaying reserve (owner, 2026-09-29): PLAN stores the per-half-hour
+  forecast until 11:00 (days.state_json slotKwh) and the effective floor;
+  every tick re-derives reserve = floor + ceil(remaining need × 1.3 / 42 ×
+  100), pro-rating the current half-hour. It equals the formula above at
+  PLAN and falls to the floor at 11:00 (e.g. flat 0.4 kW house: 17% at
+  06:00, 13% at 09:00, 11% at 10:45). Safe by construction: the house's
+  own draw is what shrinks the need, and the 1.3 factor stays on what is
+  left. State rows persisted before this change keep their fixed reserve.
   Original floor strategy, SUPERSEDED where it conflicts with the above (decided 2026-07-04, confirm with ~2 weeks of data): the
   house load is flat (~0.4 kW), so reserve_pct is expected to be near-constant
   (~17–20%). Plan of record: the owner sets minSocOnGrid ONCE, manually, in
@@ -155,6 +163,21 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
     so pv − load is PV left after house + car, i.e. what the battery is
     absorbing. The larger of two non-import quantities cannot push the car
     onto the grid; the 250 W margin covers the ~3% DC-vs-AC PV reading bias.
+    Glide (2026-09-29): the reserve DECAYS through the morning (see PLAN
+    "Decaying reserve"), so energy appears above it as the house uses up
+    its need — at 10:45 the house needs 15 min of load, not the 05:30
+    figure (owner saw the car idle at 10:45 with the battery well above
+    what the house needed). The bank above the current reserve is spread
+    evenly until 11:00: spendW = bankWh / (minutes to 11:00 + 5) × 60, one
+    tick of buffer so the last tick can't overshoot. The amp loop adds
+    spendW − (battery discharge already happening, by energy balance) to
+    its surplus; netting the discharge is essential — the meter can't see
+    it, and a bare allowance ratchets the amps up every tick. Gentle when
+    early (a 4 kWh bank at 08:00 ≈ 1.3 kW), faster close to 11:00, then
+    the car carries straight on into FREE_WINDOW without a contactor
+    cycle. Replaces the old SOLAR_TRACK → DUMPING re-entry at reserve + 5
+    (a 16 A burst): energy above the reserve always glides now. The early
+    DUMPING at 16 A is unchanged — the owner wants that before commuting.
   While stopped:
     Solar bank (2026-09-27): resume at 5 A as soon as the energy above
     reserve ((soc − reserve) × 420 Wh) covers max(0, 3.45 kW − (pv − load))
@@ -170,9 +193,14 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
     proves the battery won't discharge there (hardware floor above plan,
     e.g. PLAN's floor read failed, or a derated battery). Without it the
     bank restart saw "3% above reserve" and restarted onto paid grid every
-    tick until the cap. Only ever raises. Counts against the same 4-resume daily wear cap; past the
-    cap the reserve + 5 DUMPING re-entry still applies. Battery above
-    reserve covers any shortfall, so no import. Gated on solar_track.
+    tick until the cap. Only ever raises (and with the decaying reserve,
+    the house's remaining need is re-added on top of the learned floor).
+    Counts against the same 4-resume daily wear cap; past the cap the car
+    waits for FREE_WINDOW. Battery above reserve covers any shortfall, so
+    no import. Gated on solar_track. The run only has to last
+    min(20 min, time to 11:00): close to the window it continues into
+    FREE_WINDOW without a stop. Starts at the amps sun + glide support
+    (≥ 5 A), not always 5 A.
     Sun-only resume (unchanged): at 5 A only when the last 3 ticks (15 min) ALL showed
     pvPower − loadsPower ≥ 4.5 kW, capped at 4 solar resumes per day —
     past the cap stay stopped until FREE_WINDOW, log it. The 3-in-a-row
@@ -200,9 +228,8 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
   send set_charging_amps when target == current amps.
   Throttle counters (consecutive-surplus ticks, resumes today) live in
   stored state like everything else the pure tick reads.
-  Battery absorption while charging masks surplus the same way and the
-  loop under-feeds the car; the battery creeps up instead. Recovered by the
-  FLOOR_HOLD rule carried over: SoC > reserve + 5 → re-enter DUMPING.
+  Battery absorption while charging is visible via pv − load (above) and
+  anything the battery does bank above the reserve is glided back out.
   Exit → FREE_WINDOW at 11:00. Exit → IDLE if unplugged.
   Fallback: if feedinPower/pvPower are absent from the real-time response
   (the device's missing variables are silently omitted), degrade to the old

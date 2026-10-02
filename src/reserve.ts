@@ -49,3 +49,45 @@ export function reservePct(opts: {
   const pct = Math.ceil(((forecastKwh * safetyFactor) / batteryKwh) * 100) + floor;
   return Math.min(100, Math.max(10, pct));
 }
+
+/** Forecast house kWh for each half-hour slot 0..WINDOW_START_SLOT-1 (same
+ *  mean / bootstrap rule as reservePct). Stored at PLAN so every later tick
+ *  can re-derive the reserve without re-reading load history. */
+export function morningSlotKwh(samples: { slot: number; loadKwh: number }[]): number[] {
+  const bySlot = new Map<number, { sum: number; n: number }>();
+  for (const s of samples) {
+    const agg = bySlot.get(s.slot) ?? { sum: 0, n: 0 };
+    agg.sum += s.loadKwh;
+    agg.n += 1;
+    bySlot.set(s.slot, agg);
+  }
+  return Array.from({ length: WINDOW_START_SLOT }, (_, k) => {
+    const agg = bySlot.get(k);
+    return agg ? agg.sum / agg.n : BOOTSTRAP_SLOT_KWH;
+  });
+}
+
+/**
+ * Reserve at `nowMins`: floor + what the house still needs until 11:00.
+ * It DECAYS through the morning as that need is used up (owner, 2026-09-29:
+ * at 10:45 the house needs 15 min of load, not the 05:30 figure), reaching
+ * the floor at 11:00. The current slot is pro-rated, so at a slot boundary
+ * this equals reservePct().
+ */
+export function reserveAt(opts: {
+  nowMins: number;
+  slotKwh: number[]; // from morningSlotKwh
+  safetyFactor: number;
+  batteryKwh: number;
+  floorPct: number;
+}): number {
+  const { nowMins, slotKwh, safetyFactor, batteryKwh } = opts;
+  const floor = Math.max(10, opts.floorPct);
+  const slot = Math.floor(nowMins / 30);
+  let kwh = 0;
+  for (let k = slot; k < slotKwh.length; k++) {
+    kwh += (slotKwh[k] ?? BOOTSTRAP_SLOT_KWH) * (k === slot ? (30 - (nowMins % 30)) / 30 : 1);
+  }
+  const pct = Math.ceil(((kwh * safetyFactor) / batteryKwh) * 100) + floor;
+  return Math.min(100, Math.max(10, pct));
+}
