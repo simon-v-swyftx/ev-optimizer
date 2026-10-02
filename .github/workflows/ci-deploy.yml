@@ -1,0 +1,61 @@
+# Test every PR; on merge to main, also apply D1 migrations and deploy the
+# Worker. A failing test or typecheck blocks the deploy, so a broken build
+# never replaces the running controller (the old version keeps ticking).
+#
+# Repo secrets (Settings -> Secrets and variables -> Actions):
+#   CLOUDFLARE_API_TOKEN  - "Edit Cloudflare Workers" template + D1:Edit
+#   CLOUDFLARE_ACCOUNT_ID - dashboard sidebar, Workers & Pages
+# Worker secrets (TESSIE_TOKEN etc.) stay in Cloudflare; deploys keep them.
+name: CI / Deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch: # manual redeploy from the Actions tab
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # never cancel a deploy midway
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm test
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Migrations first: new code must never run against an old schema.
+      # Already-applied migrations are skipped, so this is a no-op most days.
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          packageManager: pnpm
+          command: |
+            d1 migrations apply ev_optimiser --remote
+            deploy

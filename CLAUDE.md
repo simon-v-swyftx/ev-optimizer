@@ -71,7 +71,8 @@ The repo is pnpm-managed (since 2026-07-04) — use `pnpm add`, never
 
 - `pnpm run dev` — wrangler dev with local cron testing
   (`curl "http://localhost:8787/__scheduled?cron=0+15+*+*+*"`)
-- `pnpm run deploy` — wrangler deploy
+- `pnpm run deploy` — wrangler deploy (manual; merging to main deploys
+  automatically via .github/workflows/ci-deploy.yml after tests pass)
 - `pnpm test` — vitest (state machine and reserve calc are pure functions;
   test them exhaustively, they run unattended at 5:30am)
 - `pnpm run migrate` — apply D1 migrations

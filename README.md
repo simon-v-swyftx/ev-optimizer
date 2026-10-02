@@ -52,5 +52,8 @@ curl "http://localhost:8787/__scheduled?cron=0+15+*+*+*"
 pnpm test
 ```
 
-Deploy with `pnpm run deploy`. Leave `shadow_mode` on and watch the
+Merging to `main` deploys automatically (`.github/workflows/ci-deploy.yml`:
+tests + typecheck, then D1 migrations, then `wrangler deploy`). It needs two
+repo secrets, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`; PRs run
+the tests only. `pnpm run deploy` still works for a manual deploy. Leave `shadow_mode` on and watch the
 `decisions` table for a few days before flipping it to `'false'`.
