@@ -2,22 +2,17 @@ import { morningSlotKwh, reserveAt } from "./reserve";
 import {
   AMP_STEP,
   BANK_RUN_MINS,
-  BATTERY_KWH,
   DERATE_IMPORT_W,
   EXPORT_MARGIN_W,
   FLOOR_IMPORT_W,
   GLIDE_BUFFER_MINS,
-  MAX_AMPS,
   MAX_SOLAR_RESUMES,
-  MIN_AMPS,
   OFF_GRID_RUNNING_STATE,
   RECOVER_IMPORT_W,
   RESERVE_BLEED_W,
   RESUME_STREAK_TICKS,
   RESUME_SURPLUS_W,
   SOAK_DISCHARGE_W,
-  SOAK_END_MINS,
-  SOAK_LAST_START_MINS,
   SOAK_LOW_TICKS,
   SOAK_MAX_STARTS,
   SOAK_MIN_SOC,
@@ -28,12 +23,11 @@ import {
   STOP_IMPORT_W,
   SUSTAINED_IMPORT_TICKS,
   SUSTAINED_IMPORT_W,
-  W_PER_AMP,
   WINDOW_DRAIN_GRACE_MINS,
   WINDOW_DRAIN_W,
-  WINDOW_END_MINS,
-  WINDOW_START_MINS,
+  SOAK_LAST_START_LEAD_MINS,
 } from "./constants";
+import type { Site } from "./site";
 
 /**
  * Pure decision function of (inputs, stored state) -> (actions, new state).
@@ -44,7 +38,7 @@ import {
 export type StateName = "IDLE" | "DUMPING" | "SOLAR_TRACK" | "FREE_WINDOW" | "SOLAR_SOAK" | "DONE";
 
 export interface StoredState {
-  date: string; // YYYY-MM-DD Brisbane
+  date: string; // YYYY-MM-DD local
   state: StateName;
   /** House reserve NOW: floorPct + forecast house need until 11:00. Re-derived
    *  every tick from slotKwh, so it decays through the morning. */
@@ -94,7 +88,8 @@ const LATE_FIELDS: Pick<
 
 export interface DecideInputs {
   date: string;
-  nowMins: number; // minutes since midnight Brisbane
+  nowMins: number; // minutes since local midnight
+  site: Site; // per-install facts (wrangler.jsonc vars)
   car: {
     pluggedIn: boolean;
     chargingState: string; // "Charging" | "Stopped" | "Complete" | "Disconnected" | ...
@@ -163,7 +158,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           highImportTicks: 0,
           ...LATE_FIELDS,
           floorPct: Math.max(10, i.floorPct ?? 10),
-          slotKwh: morningSlotKwh(i.samples),
+          slotKwh: morningSlotKwh(i.samples, i.site.windowStartMins / 30),
         };
 
   const refreshReserve = () => {
@@ -172,7 +167,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       nowMins: i.nowMins,
       slotKwh: s.slotKwh,
       safetyFactor: i.cfg.safetyFactor,
-      batteryKwh: BATTERY_KWH,
+      batteryKwh: i.site.batteryKwh,
       floorPct: s.floorPct,
     });
   };
@@ -207,7 +202,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
 
   // --- Session bookkeeping (invariants 4 + 6) ---
   if (charging && s.sessionOwner === null) {
-    if (i.nowMins >= WINDOW_START_MINS && i.nowMins < WINDOW_END_MINS && i.car.atHome) {
+    if (i.nowMins >= i.site.windowStartMins && i.nowMins < i.site.windowEndMins && i.car.atHome) {
       // The car's native 11:00 Tesla schedule (kept as the dead-controller
       // backstop) or any fresh in-window start wants exactly what we want:
       // free charge until 14:00. Adopt it so the 14:00 stop applies.
@@ -266,8 +261,8 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   }
   if (
     s.gridDown === null &&
-    i.nowMins >= WINDOW_START_MINS + WINDOW_DRAIN_GRACE_MINS &&
-    i.nowMins < WINDOW_END_MINS &&
+    i.nowMins >= i.site.windowStartMins + WINDOW_DRAIN_GRACE_MINS &&
+    i.nowMins < i.site.windowEndMins &&
     i.house.pvW !== null &&
     i.house.feedinW !== null &&
     i.house.feedinW - i.house.gridImportW - (i.house.pvW - i.house.loadW) > WINDOW_DRAIN_W
@@ -298,10 +293,10 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     return { actions: a, next: s };
   }
 
-  const phase = i.nowMins >= WINDOW_END_MINS ? "after" : i.nowMins >= WINDOW_START_MINS ? "window" : "morning";
+  const phase = i.nowMins >= i.site.windowEndMins ? "after" : i.nowMins >= i.site.windowStartMins ? "window" : "morning";
 
   if (phase === "after") {
-    const soakOn = i.cfg.solarSoak && i.nowMins < SOAK_END_MINS;
+    const soakOn = i.cfg.solarSoak && i.nowMins < i.site.soakEndMins;
     if (s.state !== "DONE" && s.state !== "SOLAR_SOAK") {
       // First after-window tick (or a re-plug after an unplug reset to IDLE).
       if (charging && s.sessionOwner === "system" && canAct) {
@@ -317,8 +312,8 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
         if (soakOn && !full && i.house.pvW !== null && i.house.feedinW !== null) {
           // Throttle to the PV the meter can see instead of stopping: no
           // contactor cycle, and the soak loop probes up from here.
-          const houseW = i.house.loadW - i.car.chargeAmps * W_PER_AMP;
-          const target = clampAmps(Math.floor((i.house.pvW - houseW - EXPORT_MARGIN_W) / W_PER_AMP));
+          const houseW = i.house.loadW - i.car.chargeAmps * i.site.wPerAmp;
+          const target = clampAmps(i.site, Math.floor((i.house.pvW - houseW - EXPORT_MARGIN_W) / i.site.wPerAmp));
           if (target !== s.lastAmps) a.push({ kind: "set_amps", amps: target });
           s.lastAmps = target;
           s.state = "SOLAR_SOAK";
@@ -337,12 +332,12 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     s.state = "FREE_WINDOW";
     if (!full && canAct) {
       if (!charging) {
-        if (canStart()) start(MAX_AMPS);
+        if (canStart()) start(i.site.maxAmps);
       } else if (s.sessionOwner === "system") {
         if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
-        if (s.lastAmps !== MAX_AMPS) {
-          a.push({ kind: "set_amps", amps: MAX_AMPS });
-          s.lastAmps = MAX_AMPS;
+        if (s.lastAmps !== i.site.maxAmps) {
+          a.push({ kind: "set_amps", amps: i.site.maxAmps });
+          s.lastAmps = i.site.maxAmps;
         }
       }
     }
@@ -372,14 +367,14 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
 
   if (st === "DUMPING" && canAct) {
     if (!charging) {
-      if (canStart()) start(MAX_AMPS);
+      if (canStart()) start(i.site.maxAmps);
     } else if (s.sessionOwner === "system") {
       if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
       let target = s.lastAmps;
       if (i.house.gridImportW > DERATE_IMPORT_W) {
-        target = Math.max(MIN_AMPS, target - AMP_STEP); // battery derated/limiting
-      } else if (i.house.gridImportW < RECOVER_IMPORT_W && target < MAX_AMPS) {
-        target = Math.min(MAX_AMPS, target + AMP_STEP);
+        target = Math.max(i.site.minAmps, target - AMP_STEP); // battery derated/limiting
+      } else if (i.house.gridImportW < RECOVER_IMPORT_W && target < i.site.maxAmps) {
+        target = Math.min(i.site.maxAmps, target + AMP_STEP);
       }
       if (target !== s.lastAmps) {
         a.push({ kind: "set_amps", amps: target });
@@ -393,8 +388,8 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     // Glide (2026-09-29): spread the battery's energy above the reserve
     // evenly until 11:00, on top of the PV, instead of leaving it idle for
     // the free refill. One tick of buffer so the last tick doesn't overshoot.
-    const minsLeft = WINDOW_START_MINS - i.nowMins;
-    const bankWh = (i.house.socPct - s.reservePct) * BATTERY_KWH * 10;
+    const minsLeft = i.site.windowStartMins - i.nowMins;
+    const bankWh = (i.house.socPct - s.reservePct) * i.site.batteryKwh * 10;
     const spendW = Math.max(0, bankWh) / ((minsLeft + GLIDE_BUFFER_MINS) / 60);
     if (!varsOk) {
       // degrade to floor-hold: stop, wait for the free window (SPEC fallback)
@@ -437,9 +432,9 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           // allowance would ratchet the amps up every tick.
           const surplusW = Math.max(i.house.feedinW! - i.house.gridImportW, i.house.pvW! - i.house.loadW);
           const dischargeW = Math.max(0, i.house.feedinW! - i.house.gridImportW - (i.house.pvW! - i.house.loadW));
-          const delta = Math.floor((surplusW + spendW - dischargeW - EXPORT_MARGIN_W) / W_PER_AMP);
-          const target = Math.min(MAX_AMPS, Math.max(MIN_AMPS, s.lastAmps + delta));
-          if (target === MIN_AMPS && s.lastAmps === MIN_AMPS && i.house.gridImportW > STOP_IMPORT_W) {
+          const delta = Math.floor((surplusW + spendW - dischargeW - EXPORT_MARGIN_W) / i.site.wPerAmp);
+          const target = Math.min(i.site.maxAmps, Math.max(i.site.minAmps, s.lastAmps + delta));
+          if (target === i.site.minAmps && s.lastAmps === i.site.minAmps && i.house.gridImportW > STOP_IMPORT_W) {
             stop("below_solar_min"); // surplus can't sustain the car's 3.45 kW minimum
             learnFloor();
           } else if (target !== s.lastAmps) {
@@ -462,7 +457,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       // Close to 11:00 the run only has to last until the window, where the
       // car keeps charging free without a contactor cycle.
       const runMins = Math.min(BANK_RUN_MINS, minsLeft);
-      const needWh = (Math.max(0, MIN_AMPS * W_PER_AMP - surplus) * runMins) / 60;
+      const needWh = (Math.max(0, i.site.minAmps * i.site.wPerAmp - surplus) * runMins) / 60;
       const banked = i.cfg.solarTrack && bankWh > 0 && bankWh >= needWh;
       if (
         (s.surplusStreak >= RESUME_STREAK_TICKS || banked) &&
@@ -471,7 +466,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       ) {
         s.surplusStreak = 0;
         s.solarResumes++;
-        start(clampAmps(Math.floor((surplus + spendW - EXPORT_MARGIN_W) / W_PER_AMP)));
+        start(clampAmps(i.site, Math.floor((surplus + spendW - EXPORT_MARGIN_W) / i.site.wPerAmp)));
       }
     }
   }
@@ -479,7 +474,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   return { actions: a, next: s };
 }
 
-const clampAmps = (a: number) => Math.min(MAX_AMPS, Math.max(MIN_AMPS, a));
+const clampAmps = (site: Site, a: number) => Math.min(site.maxAmps, Math.max(site.minAmps, a));
 
 /**
  * SOLAR_SOAK (after the free window, see SPEC): the battery is full and
@@ -537,11 +532,11 @@ function soak(
     if (i.house.socPct < SOAK_MIN_SOC) {
       stopSoak("soak_battery_low");
     } else if (batteryW > SOAK_DISCHARGE_W) {
-      if (s.lastAmps <= MIN_AMPS) {
+      if (s.lastAmps <= i.site.minAmps) {
         if (++s.soakLowTicks >= SOAK_LOW_TICKS) stopSoak("soak_below_min");
       } else {
         s.soakLowTicks = 0;
-        const target = clampAmps(s.lastAmps - Math.ceil(batteryW / W_PER_AMP));
+        const target = clampAmps(i.site, s.lastAmps - Math.ceil(batteryW / i.site.wPerAmp));
         a.push({ kind: "set_amps", amps: target });
         s.lastAmps = target;
         s.soakHold = SOAK_STEP_HOLD_TICKS;
@@ -549,9 +544,9 @@ function soak(
     } else {
       s.soakLowTicks = 0;
       const visibleW = Math.max(i.house.feedinW - i.house.gridImportW, spareW);
-      let target = s.lastAmps + Math.max(0, Math.floor((visibleW - EXPORT_MARGIN_W) / W_PER_AMP));
+      let target = s.lastAmps + Math.max(0, Math.floor((visibleW - EXPORT_MARGIN_W) / i.site.wPerAmp));
       if (target === s.lastAmps && s.soakHold === 0 && i.house.socPct >= SOAK_START_SOC) target++; // probe
-      target = clampAmps(target);
+      target = clampAmps(i.site, target);
       if (target !== s.lastAmps) {
         a.push({ kind: "set_amps", amps: target });
         s.lastAmps = target;
@@ -560,7 +555,7 @@ function soak(
   } else if (
     !h.charging &&
     i.house.socPct >= SOAK_START_SOC &&
-    i.nowMins < SOAK_LAST_START_MINS &&
+    i.nowMins < i.site.soakEndMins - SOAK_LAST_START_LEAD_MINS &&
     s.soakHold === 0 &&
     s.soakStarts < SOAK_MAX_STARTS &&
     h.canStart()
@@ -569,6 +564,6 @@ function soak(
     // at most SOAK_LOW_TICKS of the car's minimum from a full battery.
     s.soakStarts++;
     s.soakLowTicks = 0;
-    h.start(MIN_AMPS);
+    h.start(i.site.minAmps);
   }
 }

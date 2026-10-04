@@ -54,6 +54,14 @@ describe("notify", () => {
     vi.stubGlobal("fetch", fetch);
     await expect(notify(env, "hi", [0, 0, 0])).resolves.toBeUndefined();
     expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0]?.[0]).toBe("https://ntfy.sh/test-topic");
+  });
+
+  it("posts to a self-hosted server when NTFY_URL is set", async () => {
+    const fetch = vi.fn().mockResolvedValue(resp(200));
+    vi.stubGlobal("fetch", fetch);
+    await notify({ ...env, NTFY_URL: "https://ntfy.example.org/" }, "hi", [0, 0, 0]);
+    expect(fetch.mock.calls[0]?.[0]).toBe("https://ntfy.example.org/test-topic");
   });
 
   it("retries a transient 5xx (ntfy 522 behind Cloudflare) and succeeds", async () => {

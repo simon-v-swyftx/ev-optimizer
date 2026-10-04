@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { reservePct } from "./reserve";
 
-const base = { safetyFactor: 1.3, batteryKwh: 42 };
+const base = { safetyFactor: 1.3, batteryKwh: 42, windowStartSlot: 22 }; // 11:00
 
 describe("reservePct", () => {
   it("adds the forecast on top of a raised floor; below-minimum floors count as 10", () => {

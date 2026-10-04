@@ -10,6 +10,8 @@
  * (both sources hash Python raw strings). Path only: no host, query, or body.
  * Envelope: { errno, msg?, result } with errno === 0 on success.
  */
+import { localMidnightMs, offsetSuffix, type Site } from "../site";
+
 export class FoxEssClient {
   constructor(
     private apiKey: string,
@@ -124,9 +126,13 @@ export class FoxEssClient {
     return r[key] as number;
   }
 
-  /** One Brisbane day (YYYY-MM-DD) of loadsPower samples as half-hour kWh. */
-  async pullDailyLoadHistory(date: string): Promise<{ slot: number; loadKwh: number }[]> {
-    const begin = Date.parse(`${date}T00:00:00+10:00`);
+  /** One local day (YYYY-MM-DD) of loadsPower samples as half-hour kWh. */
+  async pullDailyLoadHistory(
+    date: string,
+    site: Pick<Site, "tzOffsetMins">,
+  ): Promise<{ slot: number; loadKwh: number }[]> {
+    const begin = localMidnightMs(site, date);
+    const suffix = offsetSuffix(site);
     const result = await this.post<
       { datas: { variable: string; data: { time: string; value: number }[] }[] }[]
     >("/op/v0/device/history/query", {
@@ -140,11 +146,13 @@ export class FoxEssClient {
     const bySlot = new Map<number, { sum: number; n: number }>();
     for (const s of samples) {
       // time is inverter-local, e.g. "2025-11-25 17:58:16 CST+0800". Slot
-      // arithmetic below assumes the device timezone is Brisbane; a wrong
+      // arithmetic below assumes the device timezone is UTC_OFFSET; a wrong
       // cloud-side timezone would silently phase-shift every slot, so fail
       // loud instead (the nightly caller alerts on any throw).
-      if (!s.time.endsWith("+1000")) {
-        throw new Error(`FoxESS sample time not UTC+10 (${s.time}); fix the device timezone in FoxESS cloud`);
+      if (!s.time.endsWith(suffix)) {
+        throw new Error(
+          `FoxESS sample time not UTC${suffix} (${s.time}); fix the device timezone in FoxESS cloud or UTC_OFFSET`,
+        );
       }
       // the API can over-run into the next day; keep only the requested date
       if (s.time.slice(0, 10) !== date) continue;

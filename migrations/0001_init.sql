@@ -4,7 +4,7 @@ CREATE TABLE config (
 );
 
 CREATE TABLE days (
-  date TEXT PRIMARY KEY,          -- YYYY-MM-DD Brisbane
+  date TEXT PRIMARY KEY,          -- YYYY-MM-DD local
   reserve_pct INTEGER NOT NULL,
   planned_at TEXT NOT NULL,       -- ISO timestamp
   state TEXT NOT NULL             -- current state machine state
@@ -20,7 +20,7 @@ CREATE TABLE decisions (
 );
 
 CREATE TABLE load_samples (
-  date TEXT NOT NULL,             -- YYYY-MM-DD Brisbane
+  date TEXT NOT NULL,             -- YYYY-MM-DD local
   slot_half_hour INTEGER NOT NULL,-- 0..47
   load_kwh REAL NOT NULL,
   PRIMARY KEY (date, slot_half_hour)

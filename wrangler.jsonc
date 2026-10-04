@@ -3,17 +3,46 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "triggers": {
-    // 15:00 UTC = 01:00 Brisbane: nightly pull of yesterday's load history.
-    // */5: the tick state machine, gated in code to 05:30-17:45 Brisbane.
-    // Shadow mode (config.shadow_mode, default true) logs decisions without
-    // sending car commands; flip to 'false' after the shadow week.
-    "crons": ["0 15 * * *", "*/5 * * * *"]
+    // One 5-min tick; all local-time gating is in code (DAY_START through
+    // SOLAR_SOAK_END, plus the nightly load pull at 01:00 local), so this
+    // never needs editing for your timezone.
+    // Shadow mode (D1 config shadow_mode, default on) logs decisions without
+    // sending car commands; set it to 'false' once you trust the log.
+    "crons": ["*/5 * * * *"]
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "ev_optimiser",
-      "database_id": "cdfdf939-7150-4226-a266-ee9f36bc5981"
+      // `wrangler d1 create ev_optimiser` prints this. CI substitutes the
+      // D1_DATABASE_ID repo secret, so the placeholder can stay committed.
+      "database_id": "YOUR_D1_DATABASE_ID"
     }
-  ]
+  ],
+  // Site facts, read by src/site.ts. All required; the Worker refuses to act
+  // (and alerts) if one is missing or malformed. The values below are an
+  // example install — change every one to match yours.
+  "vars": {
+    // Fixed offset from UTC, ±HH:MM. NO daylight saving support: if your
+    // region observes DST this design does not fit as-is (see SPEC.md).
+    "UTC_OFFSET": "+10:00",
+    // Free (or cheap) grid window, local time. Start must be on :00 or :30.
+    "FREE_WINDOW_START": "11:00",
+    "FREE_WINDOW_END": "14:00",
+    // First tick of the day: the morning plan runs here.
+    "DAY_START": "05:30",
+    // Afternoon solar soak hard stop — keep it before any scheduled evening
+    // battery export. No fresh soak starts in its final hour.
+    "SOLAR_SOAK_END": "17:30",
+    // Home battery usable capacity.
+    "BATTERY_KWH": 42,
+    // Charger: watts per amp = volts x phases (230 V three-phase = 690 W/A).
+    "CHARGER_VOLTS": 230,
+    "CHARGER_PHASES": 3,
+    "CHARGER_MIN_AMPS": 5,
+    "CHARGER_MAX_AMPS": 16,
+    // Car counts as home within this radius of D1 config home_lat/home_lon.
+    "HOME_RADIUS_M": 150
+    // Optional: "NTFY_URL": "https://ntfy.example.org" for a self-hosted ntfy.
+  }
 }
