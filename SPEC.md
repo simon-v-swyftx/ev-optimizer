@@ -89,7 +89,8 @@ Tesla app after a floor-stop to deliberately grid-charge before a long drive
 session and sends ONE ntfy note ("manual grid charge detected, not
 interfering"). The Tesla app start button is the escape hatch; no pause
 endpoint. Raising the car's charge limit is the "big drive tomorrow" knob.
-Session ownership is tracked in `sessions` (step 4 adds started_by).
+Session ownership lives in days.state_json (sessionOwner); the audit trail
+is the decisions table.
 
 ## State machine (ticks every 5 min, 05:30–17:45 local)
 
@@ -186,6 +187,12 @@ DUMPING (car plugged in, car_soc < car_limit, battery_soc > reserve_pct)
   path) or grid import > 8 kW (floor hit before a SoC read caught it:
   inverter stopped discharging, car now on grid). GLIDE's first tick
   throttles or stops the car — no separate stop here.
+  Quantised exit (noted 2026-10-05): the SoC check runs every 5 min at
+  full draw, ~920 Wh ≈ 2.2% of the reference battery per tick, and the
+  cloud read reports whole percent, so the dump routinely overshoots the
+  reserve by a point or two before GLIDE stops it. The 1.3 safety factor
+  absorbs it (≈ 0.65 kWh of margin on a 2.2 kWh need); don't read the
+  exit as exact, and don't tighten the factor without shortening the tick.
   Exit → FREE_WINDOW at 11:00. Exit → IDLE if unplugged.
 
 GLIDE (battery at reserve; car follows PV surplus plus the bank above the
@@ -248,7 +255,12 @@ decaying reserve — added 2026-07-05 as SOLAR_TRACK, renamed 2026-10-05)
     it, and a bare allowance ratchets the amps up every tick. Gentle when
     early (a 4 kWh bank at 08:00 ≈ 1.3 kW), faster close to 11:00, then
     the car carries straight on into FREE_WINDOW without a contactor
-    cycle. Replaces the old SOLAR_TRACK → DUMPING re-entry at reserve + 5
+    cycle. SoC resolution (noted 2026-10-05): the bank is derived from the
+    cloud's whole-percent SoC, so on the reference battery it moves in
+    420 Wh steps and the glide rate with it (one point at 10:30 ≈ 720 W of
+    allowance appearing at once). That is the floor on how smooth the
+    glide can be from the cloud API; a local Modbus feed would lift it.
+    Replaces the old SOLAR_TRACK → DUMPING re-entry at reserve + 5
     (a 16 A burst): energy above the reserve always glides now. The early
     DUMPING at 16 A is unchanged — the owner wants that before commuting.
   While stopped:
@@ -316,6 +328,15 @@ decaying reserve — added 2026-07-05 as SOLAR_TRACK, renamed 2026-10-05)
   cycling, not stopping, wears the contactor. Amp changes are contactor-
   free (pilot-signal PWM) and need no throttle beyond no-op dedupe: never
   send set_charging_amps when target == current amps.
+  Re-sync (2026-10-05): the loops reason from lastAmps, the value last
+  commanded. Once a command has had a tick to land (state ampsPending
+  clears on the next quiet tick), a system session whose car reports
+  different amps — the owner changed them in the Tesla app, or set_amps
+  was accepted but not applied — adopts the car's value, so the next step
+  is relative to reality rather than to a number the car never reached.
+  Never for owner sessions (nothing is commanded for them), and never
+  when the provider reports no amps (the charger max is assumed only for
+  a session we didn't start).
   Throttle counters (consecutive-surplus ticks, resumes today) live in
   stored state like everything else the pure tick reads.
   Battery absorption while charging is visible via pv − load (above) and
@@ -388,9 +409,11 @@ SOLAR_SOAK (14:00–17:30; added 2026-09-27)
   no EXPORT_LIMIT_W the soak never starts in this mode. The battery-
   discharge rules are unchanged and take precedence.
 
-DONE (post 17:30, or 14:00 with solar_soak off) → optional EVENING_DUMP if enabled in config: same as
-DUMPING but reserve horizon = house load until 11:00 TOMORROW. Off by
-default (trades overnight house autonomy for car charge).
+DONE (post 17:30, or 14:00 with solar_soak off). An EVENING_DUMP (same as
+DUMPING with the reserve horizon = house load until 11:00 TOMORROW) was
+sketched here but never built; the evening_dump config row went with
+migration 0004. On the reference install the morning dump already moves
+more than the overnight surplus before departure, so it buys nothing.
 
 ## FoxESS integration
 
@@ -589,22 +612,24 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
 ## Data model (D1)
 
 - config(key TEXT PK, value TEXT) — reserve safety factor, stranded_min,
-  evening_dump flag, solar_track flag (default on), glide_mode (asap |
+  solar_track flag (default on), glide_mode (asap |
   continuous, default asap), solar_soak flag (default on), soak_export
   flag (default on), shadow_mode flag
   (default ON — commands only sent when explicitly 'false'), home_lat/
   home_lon (geofence), home_detection (gps | bluetooth | gps_or_bluetooth
-  | gps_and_bluetooth, default gps), operating window
+  | gps_and_bluetooth, default gps). The evening_dump and operating-window
+  rows 0001 seeded were never read (the window comes from wrangler vars);
+  migration 0004 deletes them.
 - presence(id = 1, home INT, reported_at TEXT, source TEXT) — latest
   bluetooth / webhook car-presence report (migration 0003)
 - days(date TEXT PK, reserve_pct INT, planned_at TEXT, state TEXT)
 - decisions(id, ts, state_from, state_to, action, inputs_json) — every tick
   that does anything writes a row
 - load_samples(date, slot_half_hour INT, load_kwh REAL) — forecast input
-- sessions(id, date, started_at, ended_at, kwh_est REAL, end_reason TEXT) —
-  step 4 adds started_by (system|owner) so manual sessions are never stopped
-  by the controller (forecast hygiene is handled at ingest via Tessie charge
-  history, not this table)
+- (sessions — created by 0001 for per-session bookkeeping, never written:
+  ownership lives in days.state_json, the audit trail in decisions, and
+  forecast hygiene happens at ingest from the car API's charge history.
+  Dropped by migration 0004.)
 
 ## Failure modes → behaviour
 
@@ -638,8 +663,10 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
 - SOLAR_SOAK set_amps failing: the battery covers the car → soak_below_min
   or, at worst, the 90% SoC hard stop; the inverter floor still backstops.
 - set_charging_amps fails mid-GLIDE: import persists → next tick steps
-  down again; if import > 2 kW for 3 consecutive ticks → stop_charging +
-  alert (never sit on sustained paid import).
+  down again (from the amps the car actually reports, once the failed
+  command has had its tick — see "Re-sync" above); if import > 2 kW for 3
+  consecutive ticks → stop_charging + alert (never sit on sustained paid
+  import).
 - Every alert via ntfy.sh POST (topic in secrets).
 
 ## Costs
@@ -672,7 +699,7 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
    PLAN forecast uses all days of the last 14 (spec offered 5-weekday or
    all-days; all-days chosen — owner's load is flat). Sessions-table
    bookkeeping dropped: ownership lives in state_json, audit in decisions;
-   the table stays for a future dashboard.
+   the empty table was dropped by migration 0004 (2026-10-05).
 5. ✅ DONE 2026-07-05 — */5 cron live, gated 05:30–14:15 in code (extended
    to 17:45 on 2026-09-27 for SOLAR_SOAK). SHADOW
    MODE ON (config shadow_mode, default true — commands sent only when
