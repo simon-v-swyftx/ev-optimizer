@@ -82,7 +82,7 @@ export class FoxEssClient {
       }
       throw new Error(`FoxESS real-time missing ${names.join("/")}`);
     };
-    // pv/feedin are optional: SOLAR_TRACK degrades to floor-hold without them
+    // pv/feedin are optional: GLIDE degrades to floor-hold without them
     // (SPEC), so their absence must not kill the whole tick.
     const opt = (variable: string): number | null => {
       const v = datas.find((d) => d.variable === variable)?.value;

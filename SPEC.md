@@ -4,10 +4,12 @@ Numbers and clock times in this document describe the **reference install**
 the design was developed on (see "Reference install"). On your install they
 come from the site vars in `wrangler.jsonc` (`TIME_ZONE`,
 `FREE_WINDOW_START`/`END`, `DAY_START`, `SOLAR_SOAK_END`, `BATTERY_KWH`,
-`BATTERY_MIN_SOC`, charger volts/phases/amps, `HOME_RADIUS_M`) — read
+`BATTERY_MIN_SOC`, charger volts/phases/amps, `HOME_RADIUS_M`,
+`INVERTER_MAX_W`, optional `EXPORT_LIMIT_W`) — read
 "11:00" as "free-window start", "14:00" as "free-window end", "05:30" as
 `DAY_START`, "42 kWh" as `BATTERY_KWH`, "10% BMS minimum" as
-`BATTERY_MIN_SOC`, "16 A" as `CHARGER_MAX_AMPS`, and so on. The 8 kW
+`BATTERY_MIN_SOC`, "16 A" as `CHARGER_MAX_AMPS`, "15 kW inverter" as
+`INVERTER_MAX_W`, and so on. The 8 kW
 floor-hit import trigger and 4.5 kW solar-resume surplus scale with the
 charger (72.5% of max draw; minimum draw + 1.05 kW). "The owner" is
 whoever runs the install. Dated notes are the design's decision log.
@@ -75,7 +77,7 @@ The house reserve is enforced in HARDWARE: `minSocOnGrid` on the FoxESS
 Self-Use scheduler group (statically set by the owner — see PLAN). A dead
 controller cannot drain the house. The software detects "battery hit the
 floor" by battery SoC ≤ reserve or grid import jumping to ~11 kW, then
-throttles the car to the live PV surplus (SOLAR_TRACK), stopping it only
+throttles the car to the live PV surplus (GLIDE), stopping it only
 when the surplus cannot sustain the car's 3.45 kW three-phase minimum.
 Missed ticks cost a few minutes of paid grid power — bounded downside.
 
@@ -87,12 +89,39 @@ Tesla app after a floor-stop to deliberately grid-charge before a long drive
 session and sends ONE ntfy note ("manual grid charge detected, not
 interfering"). The Tesla app start button is the escape hatch; no pause
 endpoint. Raising the car's charge limit is the "big drive tomorrow" knob.
-Session ownership is tracked in `sessions` (step 4 adds started_by).
+Session ownership lives in days.state_json (sessionOwner); the audit trail
+is the decisions table.
 
 ## State machine (ticks every 5 min, 05:30–17:45 local)
 
-States: IDLE ⇄ DUMPING ⇄ SOLAR_TRACK → FREE_WINDOW → SOLAR_SOAK → DONE. PLAN is the
+States: IDLE → DUMPING → GLIDE → FREE_WINDOW → SOLAR_SOAK → DONE. PLAN is the
 first-tick-of-day event (creates the day's stored state), not a state.
+(GLIDE was called SOLAR_TRACK until 2026-10-05; a state row persisted under
+the old name is read as GLIDE.)
+
+One morning controller (2026-10-05): DUMPING and GLIDE share a single amp
+formula, src/tick.ts carRoomW. Watts the car may add (+) or must shed (−),
+before the 250 W export margin:
+    meterW     = feedin − import           (ground truth: + export, − import)
+    pvSpareW   = pv − load                 (PV the battery is absorbing; loadsPower includes the car)
+    allowanceW = battery power the car may draw: the inverter's whole
+                 output in DUMPING (∞); in GLIDE the glide budget net of
+                 what the battery already discharges (may be negative)
+    import > 250 W → room = meterW + min(0, allowanceW)
+                     (shed the import and any battery over-draw; a positive
+                     allowance is IGNORED — a stale bank, or a battery that
+                     cannot discharge at its hardware floor, must never
+                     ratchet the car up on paid grid; the old GLIDE loop
+                     could for a tick or two until the failsafes caught it)
+    otherwise      → room = min(INVERTER_MAX_W − load, max(meterW, pvSpareW) + allowanceW)
+The inverter term is new: DUMPING used to open at CHARGER_MAX_AMPS and
+derate 2 A per tick on import, which on the 15 kW reference inverter never
+fired but on a 5–10 kW FoxESS (most of them) meant several kW of paid
+import for 15–20 min every morning. Starts now open at what fits under the
+inverter after house load (a 6 kW inverter with the 11 kW charger starts at
+7 A, not 16); the meter still closes the loop, because the real ceiling may
+be a battery/BMS limit the var cannot know. feedin/pv missing degrade to
+the meter alone, so DUMPING keeps working without them.
 
 PLAN (first tick of day, ~05:30)
   reserve_kwh = forecast_house_load(now → 11:00) × safety_factor(1.3)
@@ -106,7 +135,7 @@ PLAN (first tick of day, ~05:30)
   floor ≥ 10% is therefore valid and there is no "floor too low" alert;
   only a failed floor read alerts. With the floor at 10% this is exactly the
   original formula. A floor read failure assumes 10%; if the real floor is
-  higher, the first import stop learns it (see SOLAR_TRACK "Learned floor").
+  higher, the first import stop learns it (see GLIDE "Learned floor").
   Decaying reserve (owner, 2026-09-29): PLAN stores the per-half-hour
   forecast until 11:00 (days.state_json slotKwh) and the effective floor;
   every tick re-derives reserve = floor + ceil(remaining need × 1.3 / 42 ×
@@ -142,19 +171,38 @@ PLAN (first tick of day, ~05:30)
   Bootstrap with flat 1.0 kW until 7 days of history exist.
 
 DUMPING (car plugged in, car_soc < car_limit, battery_soc > reserve_pct)
-  Send start_charging, set_charging_amps to 16 (max).
+  Send start_charging at the amps the inverter can deliver after house load
+  (16 A on the reference install; see "One morning controller" above).
   Each tick verify charging_state == "Charging"; if command sent but not
   charging after 2 ticks → alert.
-  If grid import > 500 W while dumping (battery derated/limiting): step amps
-  down by 2 A per tick until import ~0. Step back up likewise when headroom
-  returns.
-  Exit → SOLAR_TRACK when battery_soc ≤ reserve_pct (predictive, the normal
+  Grid import > 250 W while dumping (battery derated/limiting, or the
+  inverter var optimistic): shed amps sized to the import in one step
+  (floor((−import − 250) / 690): 3.4 kW of import at 16 A → 10 A), then
+  hold 3 ticks and probe back up 2 A per tick while import stays < 100 W.
+  Bounded hunting of ±2 A on a 20-min period at a hard battery limit,
+  instead of the old fixed 2 A/tick in both directions (which hunted every
+  tick). Export visible while dumping (sunny late morning) is taken the
+  same way, capped by the inverter.
+  Exit → GLIDE when battery_soc ≤ reserve_pct (predictive, the normal
   path) or grid import > 8 kW (floor hit before a SoC read caught it:
-  inverter stopped discharging, car now on grid). SOLAR_TRACK's first tick
+  inverter stopped discharging, car now on grid). GLIDE's first tick
   throttles or stops the car — no separate stop here.
+  Quantised exit (noted 2026-10-05): the SoC check runs every 5 min at
+  full draw, ~920 Wh ≈ 2.2% of the reference battery per tick, and the
+  cloud read reports whole percent, so the dump routinely overshoots the
+  reserve by a point or two before GLIDE stops it. The 1.3 safety factor
+  absorbs it (≈ 0.65 kWh of margin on a 2.2 kWh need); don't read the
+  exit as exact, and don't tighten the factor without shortening the tick.
   Exit → FREE_WINDOW at 11:00. Exit → IDLE if unplugged.
 
-SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
+GLIDE (battery at reserve; car follows PV surplus plus the bank above the
+decaying reserve — added 2026-07-05 as SOLAR_TRACK, renamed 2026-10-05)
+  Renamed because on most mornings here it is not tracking the sun: the
+  battery is the buffer that catches morning PV and the decaying reserve
+  frees energy above it, and GLIDE spends that bank into the car. Direct
+  PV tracking stays (the pv − load term) and matters on installs with
+  enough roof to carry the car's minimum, but the state's job is "hold the
+  reserve, glide the rest to the window".
   Replaces FLOOR_HOLD. Rationale: on stay-home mornings the dump reaches the
   reserve well before 11:00. Stopping outright wastes the morning PV — the
   battery it would otherwise charge refills for free at 11:00 anyway — and
@@ -177,7 +225,9 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
     then ran on PAID grid until below_solar_min caught it (2026-07-08,
     ~1 kWh paid import). At/below reserve a charge may only run on PV
     that covers the whole load; otherwise:
-    amps += floor((feedin_W − import_W − 250) / 690), clamped to [5, 16].
+    amps += floor((feedin_W − import_W − 250) / 690), clamped to [5, 16]
+    (since 2026-10-05 via the shared carRoomW formula above, with the
+    glide allowance and the inverter cap folded in).
     Closed loop on the METER, not pv−load arithmetic: mains-voltage error
     (~3%) and car-side taper make an open-loop estimate drift into
     sustained import; the meter is ground truth. floor() plus the 250 W
@@ -205,7 +255,12 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
     it, and a bare allowance ratchets the amps up every tick. Gentle when
     early (a 4 kWh bank at 08:00 ≈ 1.3 kW), faster close to 11:00, then
     the car carries straight on into FREE_WINDOW without a contactor
-    cycle. Replaces the old SOLAR_TRACK → DUMPING re-entry at reserve + 5
+    cycle. SoC resolution (noted 2026-10-05): the bank is derived from the
+    cloud's whole-percent SoC, so on the reference battery it moves in
+    420 Wh steps and the glide rate with it (one point at 10:30 ≈ 720 W of
+    allowance appearing at once). That is the floor on how smooth the
+    glide can be from the cloud API; a local Modbus feed would lift it.
+    Replaces the old SOLAR_TRACK → DUMPING re-entry at reserve + 5
     (a 16 A burst): energy above the reserve always glides now. The early
     DUMPING at 16 A is unchanged — the owner wants that before commuting.
   While stopped:
@@ -231,6 +286,23 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
     min(20 min, time to 11:00): close to the window it continues into
     FREE_WINDOW without a stop. Starts at the amps sun + glide support
     (≥ 5 A), not always 5 A.
+    glide_mode (D1 config, 2026-10-05; default asap = the rule above):
+    the car's minimum draw (3.45 kW three-phase) is far above the glide
+    rate for most of a sunless morning, so in practice the glide is
+    bang-bang: restart at 5 A, drain the bank in ~20 min, reserve_hit,
+    wait ~2 h for the decaying reserve to free another 3%, repeat — two
+    or three contactor cycles on a stay-home morning, bounded only by the
+    4-resume cap. (How far above depends on the roof: with enough PV to
+    carry the minimum the pv − load term keeps the car running and the
+    bank just tops it up.) 'continuous' instead restarts only once the
+    bank plus the current surplus can carry the car's minimum ALL THE WAY
+    to the window: needWh = max(0, 3.45 kW − (pv − load)) × minutes to
+    11:00. One contactor cycle, no stop, straight into FREE_WINDOW; the
+    energy sits in the battery longer, so on a morning the owner drives
+    off at 09:30 a little more is stranded. With no sun that start lands
+    minutes before the window; with 2 kW of surplus from 09:00, around
+    09:50. The sustained-sun restart (next paragraph) is unaffected, and
+    the run still ends at reserve via reserve_hit if the sun drops.
     Sun-only resume (unchanged): at 5 A only when the last 3 ticks (15 min) ALL showed
     pvPower − loadsPower ≥ 4.5 kW, capped at 4 solar resumes per day —
     past the cap stay stopped until FREE_WINDOW, log it. The 3-in-a-row
@@ -244,7 +316,7 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
   6.6 kW split east/west and rarely nears rated output, so pre-11:00 PV can
   almost never cover house + the car's 3.45 kW minimum. Expect reserve_hit
   to be the normal exit for a running charge at the reserve, the 4.5 kW
-  resume threshold to essentially never fire, and SOLAR_TRACK to behave as
+  resume threshold to essentially never fire, and GLIDE to behave as
   floor-hold: car stopped, battery holding at reserve, waiting for 11:00.
   The tracking/resume logic stays — it is the correct behaviour on the
   days the sun does deliver — but do not expect it to run often, and do
@@ -256,6 +328,15 @@ SOLAR_TRACK (battery at reserve; car follows PV surplus — added 2026-07-05)
   cycling, not stopping, wears the contactor. Amp changes are contactor-
   free (pilot-signal PWM) and need no throttle beyond no-op dedupe: never
   send set_charging_amps when target == current amps.
+  Re-sync (2026-10-05): the loops reason from lastAmps, the value last
+  commanded. Once a command has had a tick to land (state ampsPending
+  clears on the next quiet tick), a system session whose car reports
+  different amps — the owner changed them in the Tesla app, or set_amps
+  was accepted but not applied — adopts the car's value, so the next step
+  is relative to reality rather than to a number the car never reached.
+  Never for owner sessions (nothing is commanded for them), and never
+  when the provider reports no amps (the charger max is assumed only for
+  a session we didn't start).
   Throttle counters (consecutive-surplus ticks, resumes today) live in
   stored state like everything else the pure tick reads.
   Battery absorption while charging is visible via pv − load (above) and
@@ -309,10 +390,30 @@ SOLAR_SOAK (14:00–17:30; added 2026-09-27)
   At 17:30 stop (soak_end) → DONE — well before the 18:00 export.
   pvPower/feedinPower missing → alert once, stop, DONE (old 14:00 stop).
   Config: solar_soak flag, default on; 'false' = the old 14:00 stop.
+  soak_export (D1 config, 2026-10-05; default on): the loop above also
+  takes PV that is being EXPORTED (the feedin − import term), not only
+  curtailed PV. On the reference plan that is right — exporting costs
+  money once the paid 15 kWh/day is done, so any PV the inverter would
+  push out or clip may as well go into the car. On a plan that pays a
+  feed-in tariff, export is worth keeping, and a car that eats it is
+  displacing free window charge tomorrow. 'false' = curtailed PV only,
+  which needs the EXPORT_LIMIT_W site var (0 for a zero-export site):
+  curtailment is observable only as feed-in sitting at the cap with a
+  full battery. Then: the export term is dropped (visible surplus = PV
+  the battery is absorbing, −battery_W), starts and probes need feed-in
+  ≥ cap − 250 W, and feed-in falling more than 250 W below the cap while
+  charging means the car is eating export: step down by the shortfall
+  (same hold as a discharge step), and at 5 A stop on the 2nd tick
+  (soak_export_lost). The 14:00 hand-off throttles to PV beyond house +
+  cap, or stops (window_end) when that is under the car's minimum. With
+  no EXPORT_LIMIT_W the soak never starts in this mode. The battery-
+  discharge rules are unchanged and take precedence.
 
-DONE (post 17:30, or 14:00 with solar_soak off) → optional EVENING_DUMP if enabled in config: same as
-DUMPING but reserve horizon = house load until 11:00 TOMORROW. Off by
-default (trades overnight house autonomy for car charge).
+DONE (post 17:30, or 14:00 with solar_soak off). An EVENING_DUMP (same as
+DUMPING with the reserve horizon = house load until 11:00 TOMORROW) was
+sketched here but never built; its evening_dump config row is removed by
+the schema migration. On the reference install the morning dump already moves
+more than the overnight surplus before departure, so it buys nothing.
 
 ## FoxESS integration
 
@@ -334,7 +435,7 @@ default (trades overnight house autonomy for car charge).
   our inverter — SoC_1 not SoC (live-verified 2026-07-06; cost the first
   shadow morning to "real-time missing SoC" every tick) — the client requests
   and accepts both. Raw dump for diagnosis: GET /debug/foxess (admin bearer).
-  SOLAR_TRACK adds pvPower + feedinPower to the SAME call — no extra
+  GLIDE adds pvPower + feedinPower to the SAME call — no extra
   API-budget cost; presence confirmed live 2026-07-06. History = POST /op/v0/device/history/query,
   begin/end in ms, span ≤ 24 h; sample times are inverter-LOCAL strings
   ("2026-07-03 00:02:33 AEST+1000" on a UTC+10 install) at ~5-min cadence, may over-run the
@@ -504,28 +605,39 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
 - Solar array: 6.6 kW rated, split across east and west roofs, so combined
   output is rarely near rated (owner-confirmed 2026-07-08). Consequence: PV
   alone can almost never cover house load + the car's 3.45 kW minimum,
-  especially before 11:00 (east panels only) — see the SOLAR_TRACK note.
+  especially before 11:00 (east panels only) — see the GLIDE note.
 - Home geofence centre: kept out of the repo — seed the D1 config keys
   home_lat/home_lon at go-live (README "Setup").
 
 ## Data model (D1)
 
+Schema: migrations/0001_schema.sql, one idempotent file (collapsed on
+2026-10-05 from four per-step migrations before the repo went public).
+wrangler applies local migration names it has not recorded and ignores
+recorded names no longer on disk, so a database built by the old files
+simply applies the new one once: every CREATE is IF NOT EXISTS, config
+defaults are INSERT OR IGNORE, and only the never-used leftovers (the
+sessions table, three unread config rows) are removed.
+
 - config(key TEXT PK, value TEXT) — reserve safety factor, stranded_min,
-  evening_dump flag, solar_track flag (default on), solar_soak flag
-  (default on), shadow_mode flag
+  solar_track flag (default on), glide_mode (asap |
+  continuous, default asap), solar_soak flag (default on), soak_export
+  flag (default on), shadow_mode flag
   (default ON — commands only sent when explicitly 'false'), home_lat/
   home_lon (geofence), home_detection (gps | bluetooth | gps_or_bluetooth
-  | gps_and_bluetooth, default gps), operating window
+  | gps_and_bluetooth, default gps). The evening_dump and operating-window
+  rows an early migration seeded were never read (the window comes from
+  wrangler vars); the schema migration deletes them.
 - presence(id = 1, home INT, reported_at TEXT, source TEXT) — latest
-  bluetooth / webhook car-presence report (migration 0003)
+  bluetooth / webhook car-presence report
 - days(date TEXT PK, reserve_pct INT, planned_at TEXT, state TEXT)
 - decisions(id, ts, state_from, state_to, action, inputs_json) — every tick
   that does anything writes a row
 - load_samples(date, slot_half_hour INT, load_kwh REAL) — forecast input
-- sessions(id, date, started_at, ended_at, kwh_est REAL, end_reason TEXT) —
-  step 4 adds started_by (system|owner) so manual sessions are never stopped
-  by the controller (forecast hygiene is handled at ingest via Tessie charge
-  history, not this table)
+- (sessions — created by 0001 for per-session bookkeeping, never written:
+  ownership lives in days.state_json, the audit trail in decisions, and
+  forecast hygiene happens at ingest from the car API's charge history.
+  Dropped by the schema migration.)
 
 ## Failure modes → behaviour
 
@@ -553,14 +665,16 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
   gate → no commands at all; away sessions are the owner's business.
 - Location missing from cached state: treated as away (fail-safe, no
   commands); alert once if persistent.
-- pvPower/feedinPower missing from real-time response: SOLAR_TRACK degrades
+- pvPower/feedinPower missing from real-time response: GLIDE degrades
   to stop-at-floor (old FLOOR_HOLD), SOLAR_SOAK to the old 14:00 stop;
   alert once.
 - SOLAR_SOAK set_amps failing: the battery covers the car → soak_below_min
   or, at worst, the 90% SoC hard stop; the inverter floor still backstops.
-- set_charging_amps fails mid-SOLAR_TRACK: import persists → next tick steps
-  down again; if import > 2 kW for 3 consecutive ticks → stop_charging +
-  alert (never sit on sustained paid import).
+- set_charging_amps fails mid-GLIDE: import persists → next tick steps
+  down again (from the amps the car actually reports, once the failed
+  command has had its tick — see "Re-sync" above); if import > 2 kW for 3
+  consecutive ticks → stop_charging + alert (never sit on sustained paid
+  import).
 - Every alert via ntfy.sh POST (topic in secrets).
 
 ## Costs
@@ -582,18 +696,18 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
    start is an OWNER action — the next tick backs off per invariant 6),
    GET /status.
 4. ✅ DONE 2026-07-05 — decide() in src/tick.ts, pure (inputs, stored) →
-   (actions, next state); 50+ vitest cases. Session ownership, SOLAR_TRACK
+   (actions, next state); 50+ vitest cases. Session ownership, SOLAR_TRACK (now GLIDE)
    amp controller (clamp edges, stop/resume hysteresis, restart throttle +
    daily cap, no-op amp dedupe, missing-variable fallback, sustained-import
    failsafe), home geofence (unknown location = away), external-stop
    stand-down (owner stopping a SYSTEM session via the app blocks
    auto-starts until the free window, one alert; owner stopping their OWN
    session hands control back). Forecast charge-exclusion ships at ingest
-   (src/charges.ts). Persisted state = days.state_json (migration 0002).
+   (src/charges.ts). Persisted state = days.state_json.
    PLAN forecast uses all days of the last 14 (spec offered 5-weekday or
    all-days; all-days chosen — owner's load is flat). Sessions-table
    bookkeeping dropped: ownership lives in state_json, audit in decisions;
-   the table stays for a future dashboard.
+   the empty table was dropped on 2026-10-05.
 5. ✅ DONE 2026-07-05 — */5 cron live, gated 05:30–14:15 in code (extended
    to 17:45 on 2026-09-27 for SOLAR_SOAK). SHADOW
    MODE ON (config shadow_mode, default true — commands sent only when

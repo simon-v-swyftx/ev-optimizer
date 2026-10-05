@@ -26,21 +26,27 @@ Per-install facts are Worker `vars` in wrangler.jsonc, parsed and validated
 by src/site.ts and passed into the pure state machine as `DecideInputs.site`.
 Never hard-code them in logic: TIME_ZONE, FREE_WINDOW_START/END, DAY_START,
 SOLAR_SOAK_END, BATTERY_KWH, BATTERY_MIN_SOC,
-CHARGER_VOLTS/PHASES/MIN_AMPS/MAX_AMPS, HOME_RADIUS_M. Thresholds that scale
-with the hardware (floor-hit import, solar resume surplus) are derived from
-them in src/tick.ts; src/constants.ts holds only hardware-agnostic tuning. All are required — a missing var stops the controller with
-an alert rather than defaulting to another site's values.
+CHARGER_VOLTS/PHASES/MIN_AMPS/MAX_AMPS, HOME_RADIUS_M, INVERTER_MAX_W, and
+the optional EXPORT_LIMIT_W (only read when D1 config soak_export is off).
+Thresholds that scale with the hardware (floor-hit import, solar resume
+surplus, the morning start amps) are derived from them in src/tick.ts;
+src/constants.ts holds only hardware-agnostic tuning. All but the optional
+one are required — a missing var stops the controller with an alert rather
+than defaulting to another site's values.
 
 The reference install (the numbers in SPEC.md and the test suite,
 src/testing.ts):
 
 - Home battery: FoxESS, 42 kWh usable, 10% BMS floor
-- Inverter: 15 kW hybrid (car 11 kW + house ~1 kW fits within it)
+- Inverter: 15 kW hybrid (car 11 kW + house ~1 kW fits within it; most
+  FoxESS hybrids are 5–10 kW, which is why INVERTER_MAX_W sizes the dump)
 - Car: Tesla Model Y LR, three-phase 11 kW AC charging (16 A/phase; 1 A step ≈ 690 W)
 - Solar: 6.6 kW rated, split east/west roofs — rarely near rated output; PV
   alone can almost never cover house load + the car's 3.45 kW minimum
 - Free grid window: 11:00–14:00 local, Australia/Brisbane (UTC+10, no DST)
 - Battery always reaches 100% by end of the free window (owner-verified)
+- Exporting PV costs money on the plan, so the afternoon soak takes
+  exported as well as curtailed PV (config soak_export, default on)
 
 ## Non-negotiable safety invariants
 
@@ -70,11 +76,16 @@ src/testing.ts):
 
 ## Architecture
 
+- Morning states are DUMPING (battery above the house reserve, car takes
+  the inverter's output) and GLIDE (at the reserve: PV surplus plus the
+  bank above the decaying reserve, spread to the window; was SOLAR_TRACK
+  until 2026-10-05). Both run one amp formula, src/tick.ts carRoomW.
 - Runtime: Cloudflare Worker. One cron, `*/5 * * * *`; gated in code to
   DAY_START..SOLAR_SOAK_END+15 min local for the tick, and 01:00 local for
   the nightly load pull. SHADOW MODE until config shadow_mode='false' — see
   SPEC step 5
-- State: D1 (SQLite) — see migrations/0001_init.sql
+- State: D1 (SQLite) — see migrations/0001_schema.sql, a single idempotent
+  migration (add new schema changes there, keeping it re-runnable)
 - Car: one provider behind src/clients/car.ts (`CarClient`), chosen by
   which token secret is set (both or neither = config error):
   - Tessie API (https://api.tessie.com, bearer token) — handles command

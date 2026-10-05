@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
+import { decide, parseGlideMode, type Action, type DecideInputs, type StoredState } from "./tick";
 import { DEFAULT_SAFETY_FACTOR, DEFAULT_STRANDED_MIN_PCT } from "./constants";
 import { TEST_SITE } from "./testing";
+import { siteFromEnv } from "./site";
 
 /** 06:00 local, car plugged in at home below limit, battery above reserve,
  *  no sun, fresh day (stored = null -> PLAN runs). */
@@ -12,7 +13,7 @@ function base(): DecideInputs {
     site: TEST_SITE,
     car: { pluggedIn: true, chargingState: "Stopped", socPct: 50, limitPct: 80, chargeAmps: 16, atHome: true },
     house: { socPct: 44, loadW: 400, gridImportW: 0, pvW: 0, feedinW: 0 },
-    cfg: { safetyFactor: DEFAULT_SAFETY_FACTOR, strandedMinPct: DEFAULT_STRANDED_MIN_PCT, solarTrack: true, solarSoak: true, shadowMode: false },
+    cfg: { safetyFactor: DEFAULT_SAFETY_FACTOR, strandedMinPct: DEFAULT_STRANDED_MIN_PCT, solarTrack: true, glideMode: "asap", solarSoak: true, soakExport: true, shadowMode: false },
     samples: [],
     floorPct: 10,
     stored: null,
@@ -36,6 +37,8 @@ function stored(over: Partial<StoredState> = {}): StoredState {
     manualNoted: false,
     solarVarsAlerted: false,
     highImportTicks: 0,
+    ampHold: 0,
+    ampsPending: false,
     soakStarts: 0,
     soakHold: 0,
     soakLowTicks: 0,
@@ -45,6 +48,23 @@ function stored(over: Partial<StoredState> = {}): StoredState {
 }
 
 const kinds = (a: Action[]) => a.map((x) => x.kind);
+
+/** The TEST_SITE vars as strings, for per-test overrides. */
+const wranglerVars = () => ({
+  TIME_ZONE: "Australia/Brisbane",
+  FREE_WINDOW_START: "11:00",
+  FREE_WINDOW_END: "14:00",
+  DAY_START: "05:30",
+  SOLAR_SOAK_END: "17:30",
+  BATTERY_KWH: "42",
+  BATTERY_MIN_SOC: "10",
+  CHARGER_VOLTS: "230",
+  CHARGER_PHASES: "3",
+  CHARGER_MIN_AMPS: "5",
+  CHARGER_MAX_AMPS: "16",
+  HOME_RADIUS_M: "150",
+  INVERTER_MAX_W: "15000",
+});
 
 describe("PLAN (first tick of day)", () => {
   it("computes bootstrap reserve with no samples (06:00 -> 10 slots x 0.5 kWh x 1.3)", () => {
@@ -131,27 +151,91 @@ describe("DUMPING", () => {
     expect(next.sessionOwner).toBe("system");
   });
 
-  it("derates 2 A when the battery limits (import > 500 W)", () => {
+  it("derates by the import (battery limiting), then holds before probing back up", () => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.house.gridImportW = 3400; // BMS limiting the battery to ~8 kW under an 11 kW car
+    i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
+    const { actions, next } = decide(i);
+    // floor((-3400 - 250) / 690) = -6 -> 10 A, biased past the import
+    expect(actions).toContainEqual({ kind: "set_amps", amps: 10 });
+    expect(next.lastAmps).toBe(10);
+    expect(next.ampHold).toBe(3);
+    // import gone: no probe for two more ticks (15 min from the derate), then 2 A per tick
+    let st = next;
+    for (const expectAmps of [null, null, 12, 14]) {
+      const t = base();
+      t.car.chargingState = "Charging";
+      t.car.chargeAmps = st.lastAmps;
+      t.stored = st;
+      const r = decide(t);
+      if (expectAmps === null) expect(kinds(r.actions)).not.toContain("set_amps");
+      else expect(r.actions).toContainEqual({ kind: "set_amps", amps: expectAmps });
+      st = r.next;
+    }
+  });
+
+  it("a small import (noise) derates 2 A, as before", () => {
     const i = base();
     i.car.chargingState = "Charging";
     i.house.gridImportW = 600;
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
-    const { actions, next } = decide(i);
-    expect(actions).toContainEqual({ kind: "set_amps", amps: 14 });
-    expect(next.lastAmps).toBe(14);
+    expect(decide(i).actions).toContainEqual({ kind: "set_amps", amps: 14 });
   });
 
   it("recovers 2 A when headroom returns, and never exceeds 16", () => {
     const i = base();
     i.car.chargingState = "Charging";
     i.house.gridImportW = 0;
+    i.car.chargeAmps = 14;
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 14 });
     expect(decide(i).actions).toContainEqual({ kind: "set_amps", amps: 16 });
+    i.car.chargeAmps = 16;
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
     expect(kinds(decide(i).actions)).not.toContain("set_amps"); // no-op dedupe
+    // import between recover and tolerance: hold, neither direction
+    i.house.gridImportW = 200;
+    i.car.chargeAmps = 14;
+    i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 14 });
+    expect(kinds(decide(i).actions)).not.toContain("set_amps");
   });
 
-  it("exits to SOLAR_TRACK at the SoC floor and acts the same tick (spec example)", () => {
+  it("opens at what the inverter can deliver after house load (INVERTER_MAX_W)", () => {
+    // 6 kW single-stack inverter, 11 kW charger: floor((6000 - 400 - 250) / 690) = 7 A,
+    // not 16 A and 7 kW of paid import until a 2 A/tick derate caught up.
+    const small = siteFromEnv({ ...wranglerVars(), INVERTER_MAX_W: "6000" });
+    const i = base();
+    i.site = small;
+    i.stored = stored();
+    expect(decide(i).actions).toContainEqual({ kind: "start_charging", amps: 7 });
+    // and holds there: 7 A x 690 + 400 house = 5230 W, 770 W under the cap
+    const run = base();
+    run.site = small;
+    run.car.chargingState = "Charging";
+    run.house.loadW = 5230;
+    run.car.chargeAmps = 7;
+    run.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 7 });
+    expect(kinds(decide(run).actions)).not.toContain("set_amps");
+  });
+
+  it("takes export on top of the inverter cap while dumping (PV already in the output)", () => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.house = { socPct: 44, loadW: 7300, gridImportW: 0, pvW: 3000, feedinW: 1500 }; // 10 A + house
+    i.car.chargeAmps = 10;
+    i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 10 });
+    expect(decide(i).actions).toContainEqual({ kind: "set_amps", amps: 12 }); // AMP_STEP-capped
+  });
+
+  it("runs without pv/feedin (meter only)", () => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.house = { socPct: 44, loadW: 11440, gridImportW: 0, pvW: null, feedinW: null };
+    i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
+    expect(decide(i).actions).toHaveLength(0);
+  });
+
+  it("exits to GLIDE at the SoC floor and acts the same tick (spec example)", () => {
     // 16 A car + 400 W house on 6 kW PV: the floor-hit shortfall is paid
     // import, and at reserve PV doesn't cover the load -> reserve_hit now.
     const i = base();
@@ -159,7 +243,7 @@ describe("DUMPING", () => {
     i.house = { socPct: 17, loadW: 11440, gridImportW: 5440, pvW: 6000, feedinW: 0 };
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
     const { actions, next } = decide(i);
-    expect(next.state).toBe("SOLAR_TRACK");
+    expect(next.state).toBe("GLIDE");
     expect(actions).toContainEqual({ kind: "stop_charging", reason: "reserve_hit" });
   });
 
@@ -173,22 +257,23 @@ describe("DUMPING", () => {
     expect(actions).toContainEqual({ kind: "stop_charging", reason: "reserve_hit" });
   });
 
-  it("exits to SOLAR_TRACK on the 8 kW import backstop even above the SoC floor", () => {
+  it("exits to GLIDE on the 8 kW import backstop even above the SoC floor", () => {
     const i = base();
     i.car.chargingState = "Charging";
     i.house = { socPct: 30, loadW: 400, gridImportW: 9000, pvW: 0, feedinW: 0 };
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
-    expect(decide(i).next.state).toBe("SOLAR_TRACK");
+    expect(decide(i).next.state).toBe("GLIDE");
   });
 });
 
-describe("SOLAR_TRACK", () => {
+describe("GLIDE", () => {
   // pvW default covers the load: at/below reserve a charge may only run on
   // PV surplus (reserve_hit stop otherwise), so the meter-loop tests need sun.
   const solar = (over: Partial<DecideInputs["house"]>, st: Partial<StoredState> = {}): DecideInputs => {
     const i = base();
     i.house = { socPct: 17, loadW: 400, gridImportW: 0, pvW: 6000, feedinW: 0, ...over };
-    i.stored = stored({ state: "SOLAR_TRACK", ...st });
+    i.stored = stored({ state: "GLIDE", ...st });
+    i.car.chargeAmps = st.lastAmps ?? 16; // the car reports what we last commanded
     return i;
   };
 
@@ -243,7 +328,7 @@ describe("SOLAR_TRACK", () => {
     i.house = { socPct: 15, loadW: 11913, gridImportW: 19, pvW: 0, feedinW: 0 };
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16, reservePct: 16 });
     const { actions, next } = decide(i);
-    expect(next.state).toBe("SOLAR_TRACK");
+    expect(next.state).toBe("GLIDE");
     expect(actions).toContainEqual({ kind: "stop_charging", reason: "reserve_hit" });
   });
 
@@ -254,7 +339,7 @@ describe("SOLAR_TRACK", () => {
   });
 
   it("resumes only after 3 consecutive surplus ticks, at the amps the sun supports", () => {
-    let st = stored({ state: "SOLAR_TRACK" });
+    let st = stored({ state: "GLIDE" });
     for (const expectStart of [false, false, true]) {
       const i = solar({ pvW: 5200 }, st);
       const { actions, next } = decide(i);
@@ -294,7 +379,7 @@ describe("SOLAR_TRACK", () => {
   });
 
   it("sustained import (failed amp commands) stops after 3 ticks", () => {
-    let st = stored({ state: "SOLAR_TRACK", sessionOwner: "system", lastAmps: 5, highImportTicks: 0 });
+    let st = stored({ state: "GLIDE", sessionOwner: "system", lastAmps: 5, highImportTicks: 0 });
     let stopped = false;
     for (let t = 0; t < 3; t++) {
       const i = solar({ gridImportW: 2500, feedinW: 0 }, st);
@@ -328,7 +413,7 @@ describe("SOLAR_TRACK", () => {
     const { actions, next } = decide(solar({ socPct: 19, pvW: 2400 }));
     expect(actions).toContainEqual({ kind: "start_charging", amps: 5 });
     expect(next.solarResumes).toBe(1);
-    expect(next.state).toBe("SOLAR_TRACK"); // not a 16 A DUMPING burst
+    expect(next.state).toBe("GLIDE"); // not a 16 A DUMPING burst
   });
 
   it("solar bank with no sun needs car min + house for 20 min (1.28 kWh -> 4%)", () => {
@@ -371,10 +456,37 @@ describe("SOLAR_TRACK", () => {
     expect(decide(i).next.reservePct).toBe(25);
   });
 
+  it("importing with a positive glide budget never steps up (stale bank / battery at its floor)", () => {
+    // SoC 25 says 8% banked (spend ~1.1 kW at 06:00), but the meter shows
+    // 1 kW of import: the battery is not discharging here. The old formula
+    // added the budget and stepped UP onto paid grid.
+    const i = solar({ socPct: 25, loadW: 5920, pvW: 4920, gridImportW: 1000, feedinW: 0 }, { sessionOwner: "system", lastAmps: 8 });
+    i.car.chargingState = "Charging";
+    expect(decide(i).actions).toEqual([{ kind: "set_amps", amps: 6 }]); // floor((-1000-250)/690) = -2
+  });
+
+  it("the inverter cap bounds the glide too", () => {
+    const small = siteFromEnv({ ...wranglerVars(), INVERTER_MAX_W: "6000" });
+    // 10:30, SoC 25 vs reserve 17: 3360 Wh over 35 min = 5.8 kW budget, but
+    // 5 A + house already loads the inverter to 3850 W: room 2150 -> +2 A
+    const i = solar({ loadW: 3850, pvW: 0, socPct: 25 }, { sessionOwner: "system", lastAmps: 5 });
+    i.site = small;
+    i.nowMins = 10 * 60 + 30;
+    i.car.chargingState = "Charging";
+    expect(decide(i).actions).toEqual([{ kind: "set_amps", amps: 7 }]);
+  });
+
+  it("a state row persisted as SOLAR_TRACK (pre-rename) keeps acting as GLIDE", () => {
+    const i = solar({ socPct: 19, pvW: 2400 }, { state: "SOLAR_TRACK" as unknown as StoredState["state"] });
+    const { actions, next } = decide(i);
+    expect(next.state).toBe("GLIDE");
+    expect(actions).toContainEqual({ kind: "start_charging", amps: 5 });
+  });
+
   it("PV refill well above reserve glides instead of a 16 A DUMPING burst", () => {
     const i = solar({ socPct: 23, pvW: 1000 }); // reserve 17
     const { actions, next } = decide(i);
-    expect(next.state).toBe("SOLAR_TRACK");
+    expect(next.state).toBe("GLIDE");
     // 06:00: bank 6% = 2520 Wh over (300 + 5) min = 496 W; 1000 - 400 + 496 - 250 = 846 W -> 5 A
     expect(actions).toEqual([{ kind: "start_charging", amps: 5 }]);
   });
@@ -387,7 +499,8 @@ describe("decaying reserve + glide to 11:00 (2026-09-29)", () => {
     const i = base();
     i.nowMins = nowMins;
     i.house = { socPct: 14, loadW: 400, gridImportW: 0, pvW: 1000, feedinW: 0, ...house };
-    i.stored = stored({ state: "SOLAR_TRACK", slotKwh: FLAT, ...st });
+    i.stored = stored({ state: "GLIDE", slotKwh: FLAT, ...st });
+    i.car.chargeAmps = st.lastAmps ?? 16;
     return i;
   };
 
@@ -460,7 +573,7 @@ describe("decaying reserve + glide to 11:00 (2026-09-29)", () => {
     // Plant: house 400 W, PV 1.2 kW, battery covers the rest (Self-Use, no import
     // while SoC > 10% floor). SoC tracked in Wh; the controller sees whole %.
     let wh = 22 * 420; // 22% at 09:00
-    let st = stored({ state: "SOLAR_TRACK", slotKwh: FLAT });
+    let st = stored({ state: "GLIDE", slotKwh: FLAT });
     let carOn = false;
     let amps = 0;
     let carWh = 0;
@@ -486,6 +599,26 @@ describe("decaying reserve + glide to 11:00 (2026-09-29)", () => {
     expect(minMargin).toBeGreaterThan(-1); // never meaningfully below the reserve line
     expect(wh / 420).toBeLessThan(14); // bank actually spent, not stranded at 11:00
     expect(carWh).toBeGreaterThan(4000); // ~4.6 kWh into the car over two hours
+  });
+
+  it("glide_mode continuous waits until the bank carries the car to the window", () => {
+    // 10:00, reserve 12, SoC 15: 3% = 1260 Wh banked; 1 kW PV leaves a 2.85 kW
+    // deficit. asap needs 20 min (950 Wh) -> starts; continuous needs 60 min
+    // (2850 Wh) -> waits. At 10:45 both modes need the same 15 min run.
+    const asap = glide(10 * 60, { socPct: 15 });
+    expect(kinds(decide(asap).actions)).toEqual(["start_charging"]);
+    const cont = glide(10 * 60, { socPct: 15 });
+    cont.cfg.glideMode = "continuous";
+    expect(decide(cont).actions).toHaveLength(0);
+    const late = glide(10 * 60 + 45, {});
+    late.cfg.glideMode = "continuous";
+    expect(kinds(decide(late).actions)).toEqual(["start_charging"]);
+  });
+
+  it("glide_mode continuous: a sustained-sun restart is unaffected", () => {
+    const i = glide(9 * 60, { socPct: 13, pvW: 5200 }, { surplusStreak: 2 });
+    i.cfg.glideMode = "continuous";
+    expect(kinds(decide(i).actions)).toEqual(["start_charging"]);
   });
 
   it("a legacy stored row (no forecast) keeps its fixed reserve", () => {
@@ -600,7 +733,7 @@ describe("FREE_WINDOW", () => {
   it("window entry resets a morning stand-down (free power is free)", () => {
     const i = base();
     i.nowMins = 11 * 60;
-    i.stored = stored({ state: "SOLAR_TRACK", startBlocked: true });
+    i.stored = stored({ state: "GLIDE", startBlocked: true });
     const { actions } = decide(i);
     expect(actions).toContainEqual({ kind: "start_charging", amps: 16 });
   });
@@ -609,6 +742,7 @@ describe("FREE_WINDOW", () => {
     const i = base();
     i.nowMins = 12 * 60;
     i.car.chargingState = "Charging";
+    i.car.chargeAmps = 7;
     i.stored = stored({ state: "FREE_WINDOW", sessionOwner: "system", lastAmps: 7 });
     expect(decide(i).actions).toContainEqual({ kind: "set_amps", amps: 16 });
   });
@@ -865,6 +999,148 @@ describe("SOLAR_SOAK (after the window)", () => {
   });
 });
 
+describe("SOLAR_SOAK with soak_export=false (curtailed PV only)", () => {
+  const capped = siteFromEnv({ ...wranglerVars(), EXPORT_LIMIT_W: "5000" });
+  const zero = siteFromEnv({ ...wranglerVars(), EXPORT_LIMIT_W: "0" });
+  /** 15:00, battery full, car on a system session at `amps` (0 = idle). */
+  const at = (site: typeof capped | null, amps: number, over: Partial<DecideInputs["house"]>, st: Partial<StoredState> = {}) => {
+    const i = base();
+    if (site) i.site = site;
+    i.cfg.soakExport = false;
+    i.nowMins = 15 * 60;
+    i.car.chargingState = amps ? "Charging" : "Stopped";
+    i.car.chargeAmps = amps;
+    const load = 400 + amps * 690;
+    i.house = { socPct: 100, loadW: load, gridImportW: 0, pvW: load, feedinW: 0, ...over };
+    i.stored = stored({ state: "SOLAR_SOAK", sessionOwner: amps ? "system" : null, lastAmps: amps || null, ...st });
+    return i;
+  };
+
+  it("never starts without EXPORT_LIMIT_W (curtailment is invisible)", () => {
+    expect(decide(at(null, 0, { feedinW: 0 })).actions).toHaveLength(0);
+    expect(decide(at(null, 0, { feedinW: 3000, pvW: 3400 })).actions).toHaveLength(0);
+  });
+
+  it("starts at 5 A only while feed-in sits at the cap with a full battery", () => {
+    expect(decide(at(capped, 0, { feedinW: 4800, pvW: 5200 })).actions).toEqual([{ kind: "start_charging", amps: 5 }]);
+    expect(decide(at(capped, 0, { feedinW: 3000, pvW: 3400 })).actions).toHaveLength(0);
+    expect(decide(at(capped, 0, { feedinW: 4800, pvW: 5200, socPct: 96 })).actions).toHaveLength(0);
+    // zero-export site: feed-in is always "at the cap"
+    expect(decide(at(zero, 0, {})).actions).toEqual([{ kind: "start_charging", amps: 5 }]);
+  });
+
+  it("probes up while at the cap (the inverter un-curtails), ignores the export term", () => {
+    expect(decide(at(capped, 8, { feedinW: 5000, pvW: 400 + 8 * 690 + 5000 })).actions).toEqual([{ kind: "set_amps", amps: 9 }]);
+    expect(decide(at(zero, 8, {})).actions).toEqual([{ kind: "set_amps", amps: 9 }]);
+    // 2 kW of export below the cap is not "visible surplus" to take in one step
+    const i = at(capped, 6, { feedinW: 2000, pvW: 400 + 6 * 690 + 2000 });
+    expect(decide(i).actions).not.toContainEqual({ kind: "set_amps", amps: 8 });
+  });
+
+  it("feed-in below the cap: the car is eating export, step down by the shortfall and hold", () => {
+    const i = at(capped, 10, { feedinW: 3000, pvW: 400 + 10 * 690 + 3000 });
+    const { actions, next } = decide(i);
+    expect(actions).toEqual([{ kind: "set_amps", amps: 7 }]); // ceil((5000-250-3000)/690) = 3
+    expect(next.soakHold).toBe(3);
+  });
+
+  it("at 5 A and still below the cap: rides out one tick, stops on the second", () => {
+    const i = at(capped, 5, { feedinW: 3000, pvW: 400 + 5 * 690 + 3000 });
+    const first = decide(i);
+    expect(first.actions).toHaveLength(0);
+    const second = decide({ ...i, stored: first.next });
+    expect(second.actions).toEqual([{ kind: "stop_charging", reason: "soak_export_lost" }]);
+  });
+
+  it("still takes PV the battery is absorbing, and still sheds battery discharge first", () => {
+    // feed-in at the cap AND 1.5 kW going into the (99%) battery: +1 A
+    expect(decide(at(capped, 6, { socPct: 99, feedinW: 5000, pvW: 400 + 6 * 690 + 5000 + 1500 })).actions).toEqual([{ kind: "set_amps", amps: 7 }]);
+    // battery discharging 1 kW (feed-in below the cap too): the discharge step wins
+    expect(decide(at(capped, 10, { feedinW: 0, pvW: 400 + 10 * 690 - 1000 })).actions).toEqual([{ kind: "set_amps", amps: 8 }]);
+  });
+
+  it("14:00 hand-off keeps the cap: throttles to PV beyond house + cap, or stops", () => {
+    const handoff = (site: typeof capped | null, pvW: number) => {
+      const i = base();
+      if (site) i.site = site;
+      i.cfg.soakExport = false;
+      i.nowMins = 14 * 60;
+      i.car.chargingState = "Charging";
+      i.house = { socPct: 100, loadW: 11440, gridImportW: 11440 - pvW, pvW, feedinW: 0 };
+      i.stored = stored({ state: "FREE_WINDOW", sessionOwner: "system", lastAmps: 16 });
+      return decide(i);
+    };
+    // 5 kW PV against a 5 kW cap: nothing left for the car -> stop
+    expect(handoff(capped, 5000).actions).toEqual([{ kind: "stop_charging", reason: "window_end" }]);
+    // 9 kW PV: floor((9000 - 400 - 5000 - 250) / 690) = 4 -> below min -> stop
+    expect(handoff(capped, 9000).actions).toEqual([{ kind: "stop_charging", reason: "window_end" }]);
+    // 10 kW PV: 6 A
+    expect(handoff(capped, 10000).actions).toEqual([{ kind: "set_amps", amps: 6 }]);
+    // zero-export: as the default hand-off
+    expect(handoff(zero, 5000).actions).toEqual([{ kind: "set_amps", amps: 6 }]);
+    // cap unknown: stop
+    expect(handoff(null, 10000).actions).toEqual([{ kind: "stop_charging", reason: "window_end" }]);
+  });
+});
+
+describe("amps re-sync from the car (2026-10-05)", () => {
+  // GLIDE at reserve, balanced meter with 300 W export: a no-op at the
+  // commanded amps, so any action comes from the re-synced value.
+  const at = (lastAmps: number, chargeAmps: number | null, st: Partial<StoredState> = {}) => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.car.chargeAmps = chargeAmps;
+    i.house = { socPct: 17, loadW: 400 + lastAmps * 690, gridImportW: 0, pvW: 700 + lastAmps * 690, feedinW: 300 };
+    i.stored = stored({ state: "GLIDE", sessionOwner: "system", lastAmps, ...st });
+    return i;
+  };
+
+  it("adopts amps the owner changed in the app once our last command has settled", () => {
+    // we think 7 A, the car says 10 A (owner), meter balanced for 7 A: the
+    // loop now reasons from 10 and the 300 W export is a no-op there too
+    const { actions, next } = decide(at(7, 10));
+    expect(actions).toHaveLength(0);
+    expect(next.lastAmps).toBe(10);
+  });
+
+  it("a stale report right after our own set_amps does not override it", () => {
+    const { next } = decide(at(7, 16, { ampsPending: true }));
+    expect(next.lastAmps).toBe(7);
+    expect(next.ampsPending).toBe(false); // settled now: next tick may re-sync
+  });
+
+  it("a provider that reports no amps never re-syncs, and falls back to the charger max for a new session", () => {
+    expect(decide(at(7, null)).next.lastAmps).toBe(7);
+    const i = at(7, null, { lastAmps: null });
+    i.nowMins = 12 * 60; // adopted in-window session
+    expect(decide(i).next.lastAmps).toBe(16);
+  });
+
+  it("ampsPending follows the actions: set after a command, cleared after a quiet tick", () => {
+    const i = at(7, 7, { ampsPending: false });
+    i.house.feedinW = 1500; // 1.5 kW of export headroom -> set_amps
+    i.house.pvW = i.house.loadW + 1500;
+    const { actions, next } = decide(i);
+    expect(kinds(actions)).toContain("set_amps");
+    expect(next.ampsPending).toBe(true);
+    expect(decide(at(7, 7, { ampsPending: true })).next.ampsPending).toBe(false);
+  });
+
+  it("owner sessions are never re-synced (nothing is commanded for them)", () => {
+    const { next } = decide(at(7, 10, { sessionOwner: "owner" }));
+    expect(next.lastAmps).toBe(7);
+  });
+});
+
+describe("glide_mode parsing", () => {
+  it("defaults to asap, accepts both modes, rejects typos", () => {
+    expect(parseGlideMode(undefined)).toBe("asap");
+    expect(parseGlideMode("")).toBe("asap");
+    expect(parseGlideMode("continuous")).toBe("continuous");
+    expect(() => parseGlideMode("Continuous")).toThrow("glide_mode");
+  });
+});
+
 describe("grid-offline guard", () => {
   it("off-grid: stops a system charge immediately, alerts once, blocks starts", () => {
     const i = base();
@@ -977,7 +1253,8 @@ describe("amp maths sanity", () => {
           const i = base();
           i.car.chargingState = "Charging";
           i.house = { socPct: 17, loadW: 400, gridImportW: imp, pvW: 5000, feedinW: feedin };
-          i.stored = stored({ state: "SOLAR_TRACK", sessionOwner: "system", lastAmps: last });
+          i.car.chargeAmps = last;
+          i.stored = stored({ state: "GLIDE", sessionOwner: "system", lastAmps: last });
           for (const act of decide(i).actions) {
             if (act.kind === "set_amps") {
               expect(act.amps).toBeGreaterThanOrEqual(5);

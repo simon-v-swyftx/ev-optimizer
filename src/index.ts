@@ -1,4 +1,4 @@
-import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
+import { decide, parseGlideMode, type Action, type DecideInputs, type StoredState } from "./tick";
 import { FoxEssClient } from "./clients/foxess";
 import { carFromEnv, type CarClient, type CarEnv, type CarState } from "./clients/car";
 import { excludedSlots, spikeSlots } from "./charges";
@@ -301,7 +301,7 @@ export async function runTick(
       chargingState: car.chargingState,
       socPct: car.socPct,
       limitPct: car.limitPct,
-      chargeAmps: car.chargeAmps ?? site.maxAmps,
+      chargeAmps: car.chargeAmps, // null = not reported; decide() falls back to the charger max
       atHome,
     },
     house,
@@ -309,7 +309,9 @@ export async function runTick(
       safetyFactor: Number(cfg.get("safety_factor") ?? DEFAULT_SAFETY_FACTOR),
       strandedMinPct: Number(cfg.get("stranded_min_pct") ?? DEFAULT_STRANDED_MIN_PCT),
       solarTrack: cfg.get("solar_track") !== "false",
+      glideMode: parseGlideMode(cfg.get("glide_mode")),
       solarSoak: cfg.get("solar_soak") !== "false",
+      soakExport: cfg.get("soak_export") !== "false",
       shadowMode,
     },
     samples,
@@ -415,7 +417,7 @@ async function recordReadFailure(env: Env, err: unknown): Promise<void> {
 
 /** Pull yesterday's (local) load history into load_samples, dropping
  *  slots that overlap a home charging session (the car API's charge history sees
- *  ALL charges, including outside the tick window — the sessions table
+ *  ALL charges, including outside the tick window, which the decisions log
  *  cannot). Fails loud: a day with unfilterable EV load must not enter the
  *  forecast. */
 export async function pullYesterdayLoad(

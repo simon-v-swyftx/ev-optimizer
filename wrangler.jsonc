@@ -46,7 +46,15 @@
     "CHARGER_MIN_AMPS": 5,
     "CHARGER_MAX_AMPS": 16,
     // Car counts as home within this radius of D1 config home_lat/home_lon.
-    "HOME_RADIUS_M": 150
+    "HOME_RADIUS_M": 150,
+    // Most AC power the inverter can deliver to the house from the battery
+    // (plus PV), W — the nameplate rating, or the battery's discharge limit
+    // if that is lower. The morning dump opens at what fits under it after
+    // house load; the grid meter closes the loop from there.
+    "INVERTER_MAX_W": 15000
+    // Optional: "EXPORT_LIMIT_W": 5000 (0 for a zero-export site). Only read
+    // when D1 config soak_export is 'false' — then the afternoon soak takes
+    // only PV the inverter is curtailing, seen as feed-in sitting at this cap.
     // Optional: "NTFY_URL": "https://ntfy.example.org" for a self-hosted ntfy.
   }
 }

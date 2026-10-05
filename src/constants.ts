@@ -16,7 +16,12 @@
  */
 
 // --- Car / charger ---
-export const AMP_STEP = 2; // DUMPING derate/recover step per tick
+/** DUMPING: most amps added per tick while probing back up after a derate
+ *  (the real ceiling may be a battery/BMS limit the inverter var can't
+ *  know, and only the meter shows it). Down steps are sized from the import. */
+export const AMP_STEP = 2;
+/** DUMPING: ticks to hold after a derate before probing up again. */
+export const DERATE_HOLD_TICKS = 3;
 /** A bluetooth "car present" report older than this counts as NOT home
  *  (src/presence.ts). The scanner should report every ~1-5 min. */
 export const PRESENCE_MAX_AGE_MINS = 15;
@@ -36,8 +41,10 @@ export const DEFAULT_STRANDED_MIN_PCT = 30; // fallback for config stranded_min_
 // --- Control-loop tuning (src/tick.ts; _W values are watts at the grid meter) ---
 export const EXPORT_MARGIN_W = 250; // bias tracking error toward export, never import
 export const STOP_IMPORT_W = 250; // clamped at MIN_AMPS and still importing -> stop
-export const DERATE_IMPORT_W = 500; // DUMPING: battery limiting -> step down
-export const RECOVER_IMPORT_W = 100; // DUMPING: headroom back -> step up
+/** Grid import beyond this is real (not CT noise): the morning loop sheds it
+ *  and ignores any battery allowance that tick — the meter is ground truth. */
+export const IMPORT_TOLERANCE_W = 250;
+export const RECOVER_IMPORT_W = 100; // DUMPING: probes back up only below this import
 /** DUMPING: grid import above this fraction of the charger's max draw means
  *  the battery hit its floor before a SoC read caught it (rounded to 100 W;
  *  8 kW for an 11 kW charger). */
@@ -48,7 +55,7 @@ export const RESUME_HEADROOM_W = 1050;
 export const RESUME_STREAK_TICKS = 3; // 15 min of sustained sun before a restart
 export const MAX_SOLAR_RESUMES = 4; // contactor-wear cap per day
 export const RESERVE_BLEED_W = 250; // at/below reserve: load beyond pv+this = battery/grid feeding the car
-export const SUSTAINED_IMPORT_W = 2000; // SOLAR_TRACK failsafe (amp commands failing)
+export const SUSTAINED_IMPORT_W = 2000; // GLIDE failsafe (amp commands failing)
 export const SUSTAINED_IMPORT_TICKS = 3;
 export const START_CONFIRM_TICKS = 2; // invariant 4: ticks to see "Charging" after a start
 
@@ -64,9 +71,10 @@ export const WINDOW_DRAIN_W = 2000;
  *  switch into ForceCharge by a few minutes. */
 export const WINDOW_DRAIN_GRACE_MINS = 10;
 
-// --- Morning solar bank (SOLAR_TRACK, src/tick.ts) ---
-/** Resume at MIN_AMPS once the energy banked above reserve plus the current
- *  PV surplus can carry the car's minimum for this long. */
+// --- Morning solar bank (GLIDE, src/tick.ts) ---
+/** glide_mode 'asap': resume at MIN_AMPS once the energy banked above
+ *  reserve plus the current PV surplus can carry the car's minimum for this
+ *  long. ('continuous' waits until it can carry it to the free window.) */
 export const BANK_RUN_MINS = 20;
 /** Glide: spend the bank above the reserve over (minutes to window + this),
  *  so the final tick before the window can't overshoot into the floor. */
