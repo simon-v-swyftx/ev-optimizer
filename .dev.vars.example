@@ -12,3 +12,5 @@ FOXESS_DEVICE_SN=
 NTFY_TOPIC=
 # Bearer token for the admin routes (/backfill, /status, /car/*, /debug/foxess).
 ADMIN_KEY=
+# Optional: bearer for POST /presence (bluetooth car-presence feed).
+# PRESENCE_KEY=

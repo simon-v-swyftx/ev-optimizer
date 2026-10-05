@@ -1,7 +1,8 @@
 import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
 import { FoxEssClient } from "./clients/foxess";
 import { carFromEnv, type CarClient, type CarEnv, type CarState } from "./clients/car";
-import { excludedSlots, haversineM } from "./charges";
+import { excludedSlots } from "./charges";
+import { bluetoothHome, gpsHome, isHome, parseHomeDetection, type PresenceReport } from "./presence";
 import {
   DEFAULT_SAFETY_FACTOR,
   DEFAULT_STRANDED_MIN_PCT,
@@ -20,6 +21,7 @@ export interface Env extends SiteVars, CarEnv {
   NTFY_TOPIC: string;
   NTFY_URL?: string; // ntfy server, default https://ntfy.sh (self-hosters override)
   ADMIN_KEY: string; // bearer for admin HTTP routes (/backfill, step-3 endpoints)
+  PRESENCE_KEY?: string; // bearer for POST /presence (bluetooth scanner); unset = webhook off
 }
 
 // Local time is TIME_ZONE wall-clock time, DST included (invariant 5): the
@@ -112,6 +114,38 @@ export default {
         await new Promise((r) => setTimeout(r, 1100)); // FoxESS queries <= 1/s
       }
       return Response.json({ ok, failed });
+    }
+
+    // Car presence webhook: a bluetooth scanner at home (or any automation)
+    // reports whether it currently sees the car. Read by the tick when
+    // config home_detection uses bluetooth (src/presence.ts). Its own key so
+    // the device at home never holds ADMIN_KEY.
+    if (url.pathname === "/presence" && req.method === "POST") {
+      if (!env.PRESENCE_KEY) return new Response("presence webhook disabled (set PRESENCE_KEY)", { status: 404 });
+      if (req.headers.get("authorization") !== `Bearer ${env.PRESENCE_KEY}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      let body: Record<string, unknown> = {};
+      if ((req.headers.get("content-type") ?? "").includes("application/json")) {
+        try {
+          body = (await req.json()) as Record<string, unknown>;
+        } catch {
+          return new Response("bad JSON", { status: 400 });
+        }
+      }
+      const home = parsePresent(url.searchParams.get("home") ?? body.home);
+      if (home === null) return new Response("need home=true|false (query or JSON body)", { status: 400 });
+      const source = String(url.searchParams.get("source") ?? body.source ?? "").slice(0, 64) || null;
+      const reportedAt = new Date().toISOString(); // Worker clock: reporter clock skew can't matter
+      await d1Retry(() =>
+        env.DB.prepare(
+          "INSERT INTO presence (id, home, reported_at, source) VALUES (1, ?, ?, ?) " +
+            "ON CONFLICT(id) DO UPDATE SET home = excluded.home, reported_at = excluded.reported_at, source = excluded.source",
+        )
+          .bind(home ? 1 : 0, reportedAt, source)
+          .run(),
+      );
+      return Response.json({ ok: true, home, reportedAt });
     }
 
     // Manual car controls. A /car/start here is an OWNER action: the next
@@ -222,8 +256,22 @@ export async function runTick(
         )
       ).results;
 
-  const atHome =
-    car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= site.homeRadiusM;
+  // Invariant 7 gate. Unknown GPS, or a missing/stale/absent bluetooth
+  // report, counts as NOT home.
+  const homeDetection = parseHomeDetection(cfg.get("home_detection"));
+  let presence: PresenceReport | null = null;
+  if (homeDetection !== "gps") {
+    const row = await d1Retry(() =>
+      env.DB.prepare("SELECT home, reported_at FROM presence WHERE id = 1").first<{
+        home: number;
+        reported_at: string;
+      }>(),
+    );
+    presence = row ? { home: row.home === 1, reportedAtMs: Date.parse(row.reported_at) } : null;
+  }
+  const atGps = gpsHome(car.latLon, home, site.homeRadiusM);
+  const atBluetooth = bluetoothHome(presence, Date.now());
+  const atHome = isHome(homeDetection, atGps, atBluetooth);
 
   // PLAN-time read-only hardware-floor read, BEFORE decide: the house's
   // forecast energy is reserved on top of minSocOnGrid. Only the FoxESS
@@ -293,7 +341,16 @@ export async function runTick(
           stored?.state ?? "PLAN",
           next.state,
           prefix + (actions.length ? actions.map(describeAction).join(" | ") : "none"),
-          JSON.stringify({ nowMins, car: inputs.car, house, cfg: inputs.cfg, floorPct, before: stored, after: next }),
+          JSON.stringify({
+            nowMins,
+            car: inputs.car,
+            home: { mode: homeDetection, gps: atGps, bluetooth: atBluetooth, presence },
+            house,
+            cfg: inputs.cfg,
+            floorPct,
+            before: stored,
+            after: next,
+          }),
         )
         .run(),
     );
@@ -410,6 +467,13 @@ async function homeCoords(env: Env): Promise<{ lat: number; lon: number }> {
     throw new Error("config home_lat/home_lon missing (seed them per README 'Setup')");
   }
   return { lat, lon };
+}
+
+/** home=true|false|1|0 (string from a query, or a JSON boolean/number). */
+function parsePresent(v: unknown): boolean | null {
+  if (v === true || v === 1 || v === "true" || v === "1") return true;
+  if (v === false || v === 0 || v === "false" || v === "0") return false;
+  return null;
 }
 
 function nextDay(date: string): string {

@@ -68,6 +68,7 @@ There are three layers:
    | `stranded_min_pct` | `30`     | Below this car SoC, a paid charge is left running after the window. |
    | `solar_track`      | on       | Morning PV tracking below the reserve (`'false'` to disable).   |
    | `solar_soak`       | on       | Afternoon solar soak after the window (`'false'` to disable).   |
+   | `home_detection`   | `gps`    | How "car is home" is decided: `gps`, `bluetooth`, `gps_or_bluetooth` or `gps_and_bluetooth`. See "Bluetooth presence". |
 
 3. **Secrets** (`wrangler secret put …`, with local copies in `.dev.vars`):
    `TESSIE_TOKEN` + `TESSIE_VIN` **or** `TESLASCOPE_TOKEN` +
@@ -75,8 +76,8 @@ There are three layers:
    is a personal access token from Developers → Applications, and the
    vehicle ID is the public ID in your vehicle's Teslascope URL),
    `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`,
-   `NTFY_TOPIC`, and `ADMIN_KEY` (the bearer token for the admin HTTP
-   routes). Pick an unguessable ntfy topic, because anyone who knows it can
+   `NTFY_TOPIC`, `ADMIN_KEY` (the bearer token for the admin HTTP
+   routes), and optionally `PRESENCE_KEY` (see "Bluetooth presence"). Pick an unguessable ntfy topic, because anyone who knows it can
    read your alerts.
 
 Control-loop tuning, such as import/export thresholds, the wear caps on
@@ -87,6 +88,26 @@ relevant SPEC.md section before changing them.
 Set the FoxESS device timezone in FoxESS Cloud to match `TIME_ZONE`
 (including its daylight saving). The nightly load pull checks every sample's
 UTC offset against `TIME_ZONE` and fails loudly on a mismatch.
+
+## Bluetooth presence (optional)
+
+The car only gets commands when it is home. By default that's the car API's
+GPS location. You can also (or instead) use Bluetooth: a device near where
+the car parks watches for the car's Bluetooth signal and tells the Worker.
+That helps when the GPS drifts in a garage or the car API hides the location.
+
+1. `pnpm exec wrangler secret put PRESENCE_KEY` (any long random string).
+2. On a Raspberry Pi or other Linux box with Bluetooth, run
+   `scripts/ble-presence.py` with `WORKER_URL`, `PRESENCE_KEY` and
+   `TESLA_VIN` set (instructions at the top of the file). Anything else
+   can feed the same webhook instead, e.g. Home Assistant:
+   `POST /presence` with `Authorization: Bearer <PRESENCE_KEY>` and
+   `{"home": true}` or `{"home": false}`.
+3. Set `home_detection` in the D1 `config` table, for example
+   `INSERT OR REPLACE INTO config (key, value) VALUES ('home_detection','gps_or_bluetooth')`.
+
+A "home" report counts for 15 minutes, so the reporter should post every
+few minutes. If it stops, the car counts as away and nothing is sent.
 
 ## Setup
 

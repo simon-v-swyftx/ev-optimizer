@@ -53,6 +53,24 @@ not an idle away plug. Location missing or malformed → treat as NOT home,
 do nothing, log; alert once if that persists 3+ ticks while the car reports
 plugged in. "Plugged in" everywhere in this spec means plugged in at home.
 
+Bluetooth presence (added 2026-10-05, src/presence.ts): a device at home
+(scripts/ble-presence.py on a Pi, or Home Assistant / any automation) POSTs
+`/presence` (Bearer PRESENCE_KEY; `home=true|false` as query or JSON body,
+optional `source`) whenever it does or doesn't see the car's BLE
+advertisement. One row in the `presence` table, stamped with the Worker's
+clock. D1 config `home_detection` picks the gate:
+  gps (default)      — GPS geofence only (behaviour before bluetooth)
+  bluetooth          — fresh "home" report only; for car APIs with no or
+                       privacy-blurred location
+  gps_or_bluetooth   — either; covers GPS drift in a garage
+  gps_and_bluetooth  — both; strictest
+A report counts only while ≤ PRESENCE_MAX_AGE_MINS (15) old, so a dead
+scanner decays to NOT home — the same fail-safe as an unknown location. An
+unknown home_detection value fails the tick (alert) rather than silently
+switching signal. Every decision row logs {mode, gps, bluetooth, presence}.
+home_lat/home_lon stay required in every mode: the nightly charge
+exclusion still geofences charge-history locations.
+
 The house reserve is enforced in HARDWARE: `minSocOnGrid` on the FoxESS
 Self-Use scheduler group (statically set by the owner — see PLAN). A dead
 controller cannot drain the house. The software detects "battery hit the
@@ -463,7 +481,10 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
   evening_dump flag, solar_track flag (default on), solar_soak flag
   (default on), shadow_mode flag
   (default ON — commands only sent when explicitly 'false'), home_lat/
-  home_lon (geofence), operating window
+  home_lon (geofence), home_detection (gps | bluetooth | gps_or_bluetooth
+  | gps_and_bluetooth, default gps), operating window
+- presence(id = 1, home INT, reported_at TEXT, source TEXT) — latest
+  bluetooth / webhook car-presence report (migration 0003)
 - days(date TEXT PK, reserve_pct INT, planned_at TEXT, state TEXT)
 - decisions(id, ts, state_from, state_to, action, inputs_json) — every tick
   that does anything writes a row

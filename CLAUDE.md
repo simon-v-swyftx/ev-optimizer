@@ -62,9 +62,11 @@ src/testing.ts):
 6. Never stop a charging session the system did not start. The owner's
    Tesla-app start button is the deliberate manual override (e.g. paid grid
    charge before a long drive); back off and send one ntfy note.
-7. No car command unless the car is at home (cached location within
-   HOME_RADIUS_M).
-   Unknown or missing location counts as NOT home.
+7. No car command unless the car is at home: cached location within
+   HOME_RADIUS_M and/or a fresh bluetooth presence report, per D1 config
+   `home_detection` (src/presence.ts; default `gps`).
+   Unknown or missing location, or a missing/stale/away bluetooth report,
+   counts as NOT home.
 
 ## Architecture
 
@@ -105,6 +107,8 @@ The repo is pnpm-managed (since 2026-07-04) — use `pnpm add`, never
   `TESLASCOPE_VEHICLE_ID` (exactly one provider)
 - `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`
 - `NTFY_TOPIC` (optional var `NTFY_URL` for a self-hosted ntfy server)
+- `PRESENCE_KEY` (optional) — bearer for `POST /presence`, the bluetooth /
+  webhook car-presence feed (scripts/ble-presence.py); unset = route off
 - `ADMIN_KEY` — bearer for admin HTTP routes (/backfill, step-3 endpoints);
   local copy in .dev.vars (gitignored)
 
