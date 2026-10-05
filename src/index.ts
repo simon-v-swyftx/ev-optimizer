@@ -301,7 +301,7 @@ export async function runTick(
       chargingState: car.chargingState,
       socPct: car.socPct,
       limitPct: car.limitPct,
-      chargeAmps: car.chargeAmps ?? site.maxAmps,
+      chargeAmps: car.chargeAmps, // null = not reported; decide() falls back to the charger max
       atHome,
     },
     house,
@@ -417,7 +417,7 @@ async function recordReadFailure(env: Env, err: unknown): Promise<void> {
 
 /** Pull yesterday's (local) load history into load_samples, dropping
  *  slots that overlap a home charging session (the car API's charge history sees
- *  ALL charges, including outside the tick window — the sessions table
+ *  ALL charges, including outside the tick window, which the decisions log
  *  cannot). Fails loud: a day with unfilterable EV load must not enter the
  *  forecast. */
 export async function pullYesterdayLoad(

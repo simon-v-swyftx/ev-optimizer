@@ -82,6 +82,9 @@ export interface StoredState {
   highImportTicks: number; // GLIDE sustained-import failsafe
   /** DUMPING: ticks to wait after a derate before probing back up. */
   ampHold: number;
+  /** An amps command (start or set_amps) went out last tick, so the car's
+   *  reported amps may not reflect it yet: don't re-sync lastAmps from them. */
+  ampsPending: boolean;
   soakStarts: number; // SOLAR_SOAK starts today (wear cap)
   soakHold: number; // SOLAR_SOAK ticks to wait before probing up / restarting
   soakLowTicks: number; // SOLAR_SOAK consecutive ticks at MIN_AMPS with battery discharging
@@ -95,10 +98,11 @@ export interface StoredState {
  *  them, so they are defaulted when the row is loaded mid-day. */
 const lateFields = (
   site: Site,
-): Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown" | "floorPct" | "slotKwh" | "ampHold"> => ({
+): Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown" | "floorPct" | "slotKwh" | "ampHold" | "ampsPending"> => ({
   floorPct: site.batteryMinSocPct,
   slotKwh: null,
   ampHold: 0,
+  ampsPending: false,
   soakStarts: 0,
   soakHold: 0,
   soakLowTicks: 0,
@@ -118,7 +122,9 @@ export interface DecideInputs {
     chargingState: string; // "Charging" | "Stopped" | "Complete" | "Disconnected" | ...
     socPct: number;
     limitPct: number; // car's own charge limit = the target (invariant 3)
-    chargeAmps: number;
+    /** The car's requested amps (charge_amps / charge_current_request);
+     *  null = the provider doesn't report them. */
+    chargeAmps: number | null;
     atHome: boolean; // geofence, unknown location = false (invariant 7)
   };
   house: {
@@ -161,7 +167,16 @@ export type Action =
   | { kind: "notify"; message: string };
 
 export function decide(i: DecideInputs): { actions: Action[]; next: StoredState } {
+  const r = run(i);
+  // Commands are not confirmations (invariant 4): give an amps command one
+  // tick to show up in the car's cached state before trusting that state.
+  r.next.ampsPending = r.actions.some((x) => x.kind === "set_amps" || x.kind === "start_charging");
+  return r;
+}
+
+function run(i: DecideInputs): { actions: Action[]; next: StoredState } {
   const a: Action[] = [];
+  const carAmps = carAmpsOf(i);
 
   // PLAN: first tick of a new day.
   const s: StoredState =
@@ -238,7 +253,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       // Ownership is sticky, so a session the owner started BEFORE the
       // window stays theirs all the way through.
       s.sessionOwner = "system";
-      if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+      if (s.lastAmps === null) s.lastAmps = carAmps;
     } else {
       s.sessionOwner = "owner"; // the deliberate manual override
       if (!s.manualNoted && i.car.atHome) {
@@ -274,6 +289,13 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   if (!charging && s.sessionOwner === "owner") {
     s.sessionOwner = null;
     s.manualNoted = false; // next manual session gets its own note
+  }
+  // Re-sync (2026-10-05): the loops reason from lastAmps, the value we last
+  // commanded. If the car reports something else once that command has had
+  // a tick to land — the owner changed amps in the Tesla app, or our
+  // set_amps was accepted but not applied — reason from what the car says.
+  if (charging && s.sessionOwner === "system" && s.lastAmps !== null && !s.ampsPending && i.car.chargeAmps !== null) {
+    s.lastAmps = i.car.chargeAmps;
   }
 
   // --- Grid-offline guard (owner, 2026-09-27) ---
@@ -343,7 +365,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           // contactor cycle, and the soak loop probes up from here. In
           // curtailed-only mode the export cap is kept out of reach first,
           // so a car that would only eat export stops here instead.
-          const houseW = i.house.loadW - i.car.chargeAmps * i.site.wPerAmp;
+          const houseW = i.house.loadW - carAmps * i.site.wPerAmp;
           const keepW = i.cfg.soakExport ? 0 : i.site.exportLimitW;
           if (keepW !== null) {
             const raw = Math.floor((i.house.pvW - houseW - keepW - EXPORT_MARGIN_W) / i.site.wPerAmp);
@@ -371,7 +393,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       if (!charging) {
         if (canStart()) start(i.site.maxAmps);
       } else if (s.sessionOwner === "system") {
-        if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+        if (s.lastAmps === null) s.lastAmps = carAmps;
         if (s.lastAmps !== i.site.maxAmps) {
           a.push({ kind: "set_amps", amps: i.site.maxAmps });
           s.lastAmps = i.site.maxAmps;
@@ -410,6 +432,8 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
 }
 
 const clampAmps = (site: Site, a: number) => Math.min(site.maxAmps, Math.max(site.minAmps, a));
+/** Amps the car reports, or the charger max if the provider doesn't report them. */
+const carAmpsOf = (i: DecideInputs) => i.car.chargeAmps ?? i.site.maxAmps;
 const floorImportW = (site: Site) =>
   Math.round((site.maxAmps * site.wPerAmp * FLOOR_IMPORT_FRACTION) / 100) * 100;
 
@@ -467,7 +491,7 @@ function morningDump(
     return;
   }
   if (s.sessionOwner !== "system") return;
-  if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+  if (s.lastAmps === null) s.lastAmps = carAmpsOf(i);
   if (s.ampHold > 0) s.ampHold--;
   let delta = Math.floor((carRoomW(i, Infinity) - EXPORT_MARGIN_W) / i.site.wPerAmp);
   if (delta > 0) {
@@ -526,7 +550,7 @@ function morningGlide(
 
   if (h.charging) {
     if (s.sessionOwner !== "system") return;
-    if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+    if (s.lastAmps === null) s.lastAmps = carAmpsOf(i);
     if (i.house.socPct <= s.reservePct && i.house.loadW - i.house.pvW! > RESERVE_BLEED_W) {
       // Self-Use keeps the meter at ~0 while the battery covers the car, so
       // the amp loop below is blind to battery drain until the hardware
@@ -643,7 +667,7 @@ function soak(
   const exportLostW = capW === null ? 0 : Math.max(0, capW - EXPORT_MARGIN_W - i.house.feedinW);
 
   if (own) {
-    if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+    if (s.lastAmps === null) s.lastAmps = carAmpsOf(i);
     const stopSoak = (reason: string) => {
       h.stop(reason);
       s.soakHold = SOAK_RESTART_HOLD_TICKS;

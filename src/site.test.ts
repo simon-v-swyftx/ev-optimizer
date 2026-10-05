@@ -160,6 +160,7 @@ describe("decide honours the site", () => {
       const i = inputs(400, site);
       i.car.chargingState = "Charging";
       i.house = { ...i.house, socPct: 60, loadW: 7800, gridImportW };
+      i.car.chargeAmps = 32;
       i.stored = { ...decide(inputs(395, site)).next, state: "DUMPING", sessionOwner: "system", lastAmps: 32 };
       return decide(i).next.state;
     };

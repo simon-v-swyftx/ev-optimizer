@@ -38,6 +38,7 @@ function stored(over: Partial<StoredState> = {}): StoredState {
     solarVarsAlerted: false,
     highImportTicks: 0,
     ampHold: 0,
+    ampsPending: false,
     soakStarts: 0,
     soakHold: 0,
     soakLowTicks: 0,
@@ -165,6 +166,7 @@ describe("DUMPING", () => {
     for (const expectAmps of [null, null, 12, 14]) {
       const t = base();
       t.car.chargingState = "Charging";
+      t.car.chargeAmps = st.lastAmps;
       t.stored = st;
       const r = decide(t);
       if (expectAmps === null) expect(kinds(r.actions)).not.toContain("set_amps");
@@ -185,12 +187,15 @@ describe("DUMPING", () => {
     const i = base();
     i.car.chargingState = "Charging";
     i.house.gridImportW = 0;
+    i.car.chargeAmps = 14;
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 14 });
     expect(decide(i).actions).toContainEqual({ kind: "set_amps", amps: 16 });
+    i.car.chargeAmps = 16;
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 16 });
     expect(kinds(decide(i).actions)).not.toContain("set_amps"); // no-op dedupe
     // import between recover and tolerance: hold, neither direction
     i.house.gridImportW = 200;
+    i.car.chargeAmps = 14;
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 14 });
     expect(kinds(decide(i).actions)).not.toContain("set_amps");
   });
@@ -208,6 +213,7 @@ describe("DUMPING", () => {
     run.site = small;
     run.car.chargingState = "Charging";
     run.house.loadW = 5230;
+    run.car.chargeAmps = 7;
     run.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 7 });
     expect(kinds(decide(run).actions)).not.toContain("set_amps");
   });
@@ -216,6 +222,7 @@ describe("DUMPING", () => {
     const i = base();
     i.car.chargingState = "Charging";
     i.house = { socPct: 44, loadW: 7300, gridImportW: 0, pvW: 3000, feedinW: 1500 }; // 10 A + house
+    i.car.chargeAmps = 10;
     i.stored = stored({ state: "DUMPING", sessionOwner: "system", lastAmps: 10 });
     expect(decide(i).actions).toContainEqual({ kind: "set_amps", amps: 12 }); // AMP_STEP-capped
   });
@@ -266,6 +273,7 @@ describe("GLIDE", () => {
     const i = base();
     i.house = { socPct: 17, loadW: 400, gridImportW: 0, pvW: 6000, feedinW: 0, ...over };
     i.stored = stored({ state: "GLIDE", ...st });
+    i.car.chargeAmps = st.lastAmps ?? 16; // the car reports what we last commanded
     return i;
   };
 
@@ -492,6 +500,7 @@ describe("decaying reserve + glide to 11:00 (2026-09-29)", () => {
     i.nowMins = nowMins;
     i.house = { socPct: 14, loadW: 400, gridImportW: 0, pvW: 1000, feedinW: 0, ...house };
     i.stored = stored({ state: "GLIDE", slotKwh: FLAT, ...st });
+    i.car.chargeAmps = st.lastAmps ?? 16;
     return i;
   };
 
@@ -733,6 +742,7 @@ describe("FREE_WINDOW", () => {
     const i = base();
     i.nowMins = 12 * 60;
     i.car.chargingState = "Charging";
+    i.car.chargeAmps = 7;
     i.stored = stored({ state: "FREE_WINDOW", sessionOwner: "system", lastAmps: 7 });
     expect(decide(i).actions).toContainEqual({ kind: "set_amps", amps: 16 });
   });
@@ -1073,6 +1083,55 @@ describe("SOLAR_SOAK with soak_export=false (curtailed PV only)", () => {
   });
 });
 
+describe("amps re-sync from the car (2026-10-05)", () => {
+  // GLIDE at reserve, balanced meter with 300 W export: a no-op at the
+  // commanded amps, so any action comes from the re-synced value.
+  const at = (lastAmps: number, chargeAmps: number | null, st: Partial<StoredState> = {}) => {
+    const i = base();
+    i.car.chargingState = "Charging";
+    i.car.chargeAmps = chargeAmps;
+    i.house = { socPct: 17, loadW: 400 + lastAmps * 690, gridImportW: 0, pvW: 700 + lastAmps * 690, feedinW: 300 };
+    i.stored = stored({ state: "GLIDE", sessionOwner: "system", lastAmps, ...st });
+    return i;
+  };
+
+  it("adopts amps the owner changed in the app once our last command has settled", () => {
+    // we think 7 A, the car says 10 A (owner), meter balanced for 7 A: the
+    // loop now reasons from 10 and the 300 W export is a no-op there too
+    const { actions, next } = decide(at(7, 10));
+    expect(actions).toHaveLength(0);
+    expect(next.lastAmps).toBe(10);
+  });
+
+  it("a stale report right after our own set_amps does not override it", () => {
+    const { next } = decide(at(7, 16, { ampsPending: true }));
+    expect(next.lastAmps).toBe(7);
+    expect(next.ampsPending).toBe(false); // settled now: next tick may re-sync
+  });
+
+  it("a provider that reports no amps never re-syncs, and falls back to the charger max for a new session", () => {
+    expect(decide(at(7, null)).next.lastAmps).toBe(7);
+    const i = at(7, null, { lastAmps: null });
+    i.nowMins = 12 * 60; // adopted in-window session
+    expect(decide(i).next.lastAmps).toBe(16);
+  });
+
+  it("ampsPending follows the actions: set after a command, cleared after a quiet tick", () => {
+    const i = at(7, 7, { ampsPending: false });
+    i.house.feedinW = 1500; // 1.5 kW of export headroom -> set_amps
+    i.house.pvW = i.house.loadW + 1500;
+    const { actions, next } = decide(i);
+    expect(kinds(actions)).toContain("set_amps");
+    expect(next.ampsPending).toBe(true);
+    expect(decide(at(7, 7, { ampsPending: true })).next.ampsPending).toBe(false);
+  });
+
+  it("owner sessions are never re-synced (nothing is commanded for them)", () => {
+    const { next } = decide(at(7, 10, { sessionOwner: "owner" }));
+    expect(next.lastAmps).toBe(7);
+  });
+});
+
 describe("glide_mode parsing", () => {
   it("defaults to asap, accepts both modes, rejects typos", () => {
     expect(parseGlideMode(undefined)).toBe("asap");
@@ -1194,6 +1253,7 @@ describe("amp maths sanity", () => {
           const i = base();
           i.car.chargingState = "Charging";
           i.house = { socPct: 17, loadW: 400, gridImportW: imp, pvW: 5000, feedinW: feedin };
+          i.car.chargeAmps = last;
           i.stored = stored({ state: "GLIDE", sessionOwner: "system", lastAmps: last });
           for (const act of decide(i).actions) {
             if (act.kind === "set_amps") {
