@@ -6,8 +6,10 @@
  * charging_state on the following tick.
  */
 import type { Charge } from "../charges";
+import type { CarClient, CarState } from "./car";
 
-export class TessieClient {
+export class TessieClient implements CarClient {
+  readonly name = "tessie";
   constructor(
     private token: string,
     private vin: string,
@@ -16,14 +18,7 @@ export class TessieClient {
 
   /** Cached car state (does not wake the car). Fails loud on missing fields —
    *  the tick skips and alerts rather than acting on partial data. */
-  async getCarState(): Promise<{
-    pluggedIn: boolean;
-    chargingState: string;
-    socPct: number;
-    limitPct: number;
-    chargeAmps: number | null;
-    latLon: { lat: number; lon: number } | null;
-  }> {
+  async getCarState(): Promise<CarState> {
     const raw = (await this.req("GET", `/${this.vin}/state`)) as {
       charge_state?: Record<string, unknown>;
       drive_state?: Record<string, unknown>;
@@ -49,6 +44,9 @@ export class TessieClient {
       chargeAmps: num("charge_amps"), // null = not reported
       latLon,
     };
+  }
+  async rawState(): Promise<unknown> {
+    return this.req("GET", `/${this.vin}/state`);
   }
   async startCharging(): Promise<void> {
     await this.req("POST", `/${this.vin}/command/start_charging`);

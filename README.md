@@ -23,8 +23,13 @@ You need:
   from foxesscloud.com → User Profile → API Management). The inverter should
   run Self-Use outside the free window and ForceCharge during it. You set that
   schedule yourself in the FoxESS app.
-- **A Tesla on a [Tessie](https://tessie.com) account.** Tessie signs the
-  commands and serves cached state without waking the car.
+- **A Tesla on a [Tessie](https://tessie.com),
+  [Teslascope](https://teslascope.com) or [TeslaFi](https://www.teslafi.com)
+  account.** Any of them signs the commands and serves cached state without
+  waking the car. Teslascope and TeslaFi support is newer: run in shadow
+  mode and check `GET /debug/car` and your first `/backfill` before
+  trusting it (see SPEC.md "Teslascope integration" / "TeslaFi
+  integration").
 - **A daily free or cheap grid window** at the same local (wall-clock) time
   each day. Daylight saving is handled: set `TIME_ZONE` to your IANA zone and
   the window follows the clock change.
@@ -33,7 +38,7 @@ You need:
 
 ## How it works
 
-A cron runs every 5 minutes. Each tick reads the car (Tessie) and the
+A cron runs every 5 minutes. Each tick reads the car (Tessie, Teslascope or TeslaFi) and the
 inverter (FoxESS Open API) and runs a pure state machine (`src/tick.ts`). It
 then sends the resulting car commands: start, stop and set amps. The
 inverter is never written to. The FoxESS `minSocOnGrid` floor and the car's
@@ -64,11 +69,19 @@ There are three layers:
    | `stranded_min_pct` | `30`     | Below this car SoC, a paid charge is left running after the window. |
    | `solar_track`      | on       | Morning PV tracking below the reserve (`'false'` to disable).   |
    | `solar_soak`       | on       | Afternoon solar soak after the window (`'false'` to disable).   |
+   | `home_detection`   | `gps`    | How "car is home" is decided: `gps`, `bluetooth`, `gps_or_bluetooth` or `gps_and_bluetooth`. See "Bluetooth presence". |
 
 3. **Secrets** (`wrangler secret put …`, with local copies in `.dev.vars`):
-   `TESSIE_TOKEN`, `TESSIE_VIN`, `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`,
-   `NTFY_TOPIC`, and `ADMIN_KEY` (the bearer token for the admin HTTP
-   routes). Pick an unguessable ntfy topic, because anyone who knows it can
+   `TESSIE_TOKEN` + `TESSIE_VIN` **or** `TESLASCOPE_TOKEN` +
+   `TESLASCOPE_VEHICLE_ID` **or** `TESLAFI_TOKEN` (exactly one car
+   provider). The Teslascope token is a personal access token from
+   Developers → Applications, and the vehicle ID is the public ID in your
+   vehicle's Teslascope URL. The TeslaFi token is under Settings → Tesla
+   API → API Token; on the Commands tab also tick Charge Start, Charge
+   Stop and Set Charging Amps, or TeslaFi refuses them.
+   `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`,
+   `NTFY_TOPIC`, `ADMIN_KEY` (the bearer token for the admin HTTP
+   routes), and optionally `PRESENCE_KEY` (see "Bluetooth presence"). Pick an unguessable ntfy topic, because anyone who knows it can
    read your alerts.
 
 Control-loop tuning, such as import/export thresholds, the wear caps on
@@ -80,6 +93,26 @@ Set the FoxESS device timezone in FoxESS Cloud to match `TIME_ZONE`
 (including its daylight saving). The nightly load pull checks every sample's
 UTC offset against `TIME_ZONE` and fails loudly on a mismatch.
 
+## Bluetooth presence (optional)
+
+The car only gets commands when it is home. By default that's the car API's
+GPS location. You can also (or instead) use Bluetooth: a device near where
+the car parks watches for the car's Bluetooth signal and tells the Worker.
+That helps when the GPS drifts in a garage or the car API hides the location.
+
+1. `pnpm exec wrangler secret put PRESENCE_KEY` (any long random string).
+2. On a Raspberry Pi or other Linux box with Bluetooth, run
+   `scripts/ble-presence.py` with `WORKER_URL`, `PRESENCE_KEY` and
+   `TESLA_VIN` set (instructions at the top of the file). Anything else
+   can feed the same webhook instead, e.g. Home Assistant:
+   `POST /presence` with `Authorization: Bearer <PRESENCE_KEY>` and
+   `{"home": true}` or `{"home": false}`.
+3. Set `home_detection` in the D1 `config` table, for example
+   `INSERT OR REPLACE INTO config (key, value) VALUES ('home_detection','gps_or_bluetooth')`.
+
+A "home" report counts for 15 minutes, so the reporter should post every
+few minutes. If it stops, the car counts as away and nothing is sent.
+
 ## Setup
 
 The repo is pnpm-managed, so don't use `npm install`.
@@ -90,7 +123,7 @@ pnpm exec wrangler d1 create ev_optimiser   # put the printed id in wrangler.jso
 # edit the "vars" block in wrangler.jsonc for your site
 pnpm run migrate -- --remote                # pnpm run migrate alone targets the local dev DB
 cp .dev.vars.example .dev.vars              # fill in local secrets
-pnpm exec wrangler secret put TESSIE_TOKEN  # repeat for every secret
+pnpm exec wrangler secret put TESSIE_TOKEN  # repeat for every secret (or TESLASCOPE_* / TESLAFI_TOKEN)
 pnpm exec wrangler d1 execute ev_optimiser --remote \
   --command "INSERT INTO config (key, value) VALUES ('home_lat','<lat>'), ('home_lon','<lon>')"
 pnpm test

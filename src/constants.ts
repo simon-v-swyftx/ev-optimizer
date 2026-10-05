@@ -8,7 +8,7 @@
  *     changing.
  *  2. D1 `config` table — runtime settings changed without a redeploy:
  *     home_lat/home_lon, shadow_mode, safety_factor, stranded_min_pct,
- *     solar_track, solar_soak (see README "Configuration").
+ *     solar_track, solar_soak, home_detection (see README "Configuration").
  *  3. Wrangler secrets — credentials (see .dev.vars.example).
  *
  * A fork should only need wrangler.jsonc, the D1 config rows and the
@@ -17,6 +17,9 @@
 
 // --- Car / charger ---
 export const AMP_STEP = 2; // DUMPING derate/recover step per tick
+/** A bluetooth "car present" report older than this counts as NOT home
+ *  (src/presence.ts). The scanner should report every ~1-5 min. */
+export const PRESENCE_MAX_AGE_MINS = 15;
 
 // --- Operating window ---
 /** Ticks keep running this long past the solar-soak end so its stop lands. */

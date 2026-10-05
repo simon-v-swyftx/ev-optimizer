@@ -56,3 +56,27 @@ export function excludedSlots(
   }
   return out;
 }
+
+/**
+ * Fallback for car APIs with no charge history (TeslaFi): exclude every
+ * slot whose load averages at least the car's minimum draw
+ * (minAmps x wPerAmp), plus its neighbours, which catch the partial slots
+ * where a charge started or ended. A house alone rarely sustains that for
+ * half an hour. Same stance as excludedSlots (over-exclude rather than bake
+ * the charger into the forecast); a charge shorter than a slot, or a real
+ * house load this big, is the accepted error.
+ */
+export function spikeSlots(
+  rows: { slot: number; loadKwh: number }[],
+  site: Pick<Site, "minAmps" | "wPerAmp">,
+): Set<number> {
+  const thresholdKwh = (site.minAmps * site.wPerAmp) / 1000 / 2; // per half hour
+  const out = new Set<number>();
+  for (const r of rows) {
+    if (r.loadKwh >= thresholdKwh) {
+      out.add(r.slot - 1).add(r.slot).add(r.slot + 1);
+    }
+  }
+  out.delete(-1);
+  return out; // a slot past the day's end is harmless: no row carries it
+}

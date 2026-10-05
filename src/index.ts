@@ -1,7 +1,8 @@
 import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
 import { FoxEssClient } from "./clients/foxess";
-import { TessieClient } from "./clients/tessie";
-import { excludedSlots, haversineM } from "./charges";
+import { carFromEnv, type CarClient, type CarEnv, type CarState } from "./clients/car";
+import { excludedSlots, spikeSlots } from "./charges";
+import { bluetoothHome, gpsHome, isHome, parseHomeDetection, type PresenceReport } from "./presence";
 import {
   DEFAULT_SAFETY_FACTOR,
   DEFAULT_STRANDED_MIN_PCT,
@@ -11,15 +12,16 @@ import {
 } from "./constants";
 import { addDays, localMidnightMs, localNow, siteFromEnv, type Site, type SiteVars } from "./site";
 
-export interface Env extends SiteVars {
+export interface Env extends SiteVars, CarEnv {
   DB: D1Database;
-  TESSIE_TOKEN: string;
-  TESSIE_VIN: string;
+  // Car API: set exactly one of TESSIE_TOKEN (+ TESSIE_VIN) or
+  // TESLASCOPE_TOKEN (+ TESLASCOPE_VEHICLE_ID); see src/clients/car.ts.
   FOXESS_API_KEY: string;
   FOXESS_DEVICE_SN: string;
   NTFY_TOPIC: string;
   NTFY_URL?: string; // ntfy server, default https://ntfy.sh (self-hosters override)
   ADMIN_KEY: string; // bearer for admin HTTP routes (/backfill, step-3 endpoints)
+  PRESENCE_KEY?: string; // bearer for POST /presence (bluetooth scanner); unset = webhook off
 }
 
 // Local time is TIME_ZONE wall-clock time, DST included (invariant 5): the
@@ -36,8 +38,10 @@ export default {
   // cron never needs editing when the timezone or windows change.
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     let site: Site;
+    let car: CarClient;
     try {
       site = siteFromEnv(env);
+      car = carFromEnv(env);
     } catch (err) {
       console.error("bad site config", err);
       // Alert once an hour, not every tick: the fix is a redeploy anyway.
@@ -49,11 +53,10 @@ export default {
     const local = localNow(site);
     const mins = localMins(local);
     const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
-    const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
 
     if (mins >= NIGHTLY_PULL_MINS && mins < NIGHTLY_PULL_MINS + 5) {
       ctx.waitUntil(
-        pullYesterdayLoad(env, site, foxess, tessie, local).catch(async (err) => {
+        pullYesterdayLoad(env, site, foxess, car, local).catch(async (err) => {
           console.error("nightly load pull failed", err); // survives even if ntfy is down
           await notify(env, `nightly load pull failed: ${err instanceof Error ? err.message : String(err)}`);
         }),
@@ -64,7 +67,7 @@ export default {
     if (!withinOperatingWindow(local, site)) return;
 
     ctx.waitUntil(
-      runTick(env, site, foxess, tessie, local).catch(async (err) => {
+      runTick(env, site, foxess, car, local).catch(async (err) => {
         console.error("tick failed", err); // survives even if ntfy is down
         await notify(env, `tick failed: ${err instanceof Error ? err.message : String(err)}`);
       }),
@@ -92,18 +95,20 @@ export default {
       }
       const site = siteFromEnv(env);
       const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
-      const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
+      const car = carFromEnv(env);
       // One charges call for the whole range (padded a day each side for
       // midnight-spanning sessions) keeps the request under subrequest limits.
       const home = await homeCoords(env);
       const fromMs = localMidnightMs(site, from);
       const toMs = localMidnightMs(site, to);
-      const charges = await tessie.getCharges((fromMs - 86_400_000) / 1000, (toMs + 2 * 86_400_000) / 1000);
+      const charges = car.getCharges
+        ? await car.getCharges((fromMs - 86_400_000) / 1000, (toMs + 2 * 86_400_000) / 1000)
+        : null; // no charge history: pullDayLoad falls back to spikeSlots
       const ok: string[] = [];
       const failed: Record<string, string> = {};
       for (let d = from; d <= to; d = nextDay(d)) {
         try {
-          await pullDayLoad(env, site, foxess, d, excludedSlots(charges, home, d, Date.now(), site));
+          await pullDayLoad(env, site, foxess, d, charges && excludedSlots(charges, home, d, Date.now(), site));
           ok.push(d);
         } catch (err) {
           failed[d] = err instanceof Error ? err.message : String(err);
@@ -113,16 +118,48 @@ export default {
       return Response.json({ ok, failed });
     }
 
+    // Car presence webhook: a bluetooth scanner at home (or any automation)
+    // reports whether it currently sees the car. Read by the tick when
+    // config home_detection uses bluetooth (src/presence.ts). Its own key so
+    // the device at home never holds ADMIN_KEY.
+    if (url.pathname === "/presence" && req.method === "POST") {
+      if (!env.PRESENCE_KEY) return new Response("presence webhook disabled (set PRESENCE_KEY)", { status: 404 });
+      if (req.headers.get("authorization") !== `Bearer ${env.PRESENCE_KEY}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      let body: Record<string, unknown> = {};
+      if ((req.headers.get("content-type") ?? "").includes("application/json")) {
+        try {
+          body = (await req.json()) as Record<string, unknown>;
+        } catch {
+          return new Response("bad JSON", { status: 400 });
+        }
+      }
+      const home = parsePresent(url.searchParams.get("home") ?? body.home);
+      if (home === null) return new Response("need home=true|false (query or JSON body)", { status: 400 });
+      const source = String(url.searchParams.get("source") ?? body.source ?? "").slice(0, 64) || null;
+      const reportedAt = new Date().toISOString(); // Worker clock: reporter clock skew can't matter
+      await d1Retry(() =>
+        env.DB.prepare(
+          "INSERT INTO presence (id, home, reported_at, source) VALUES (1, ?, ?, ?) " +
+            "ON CONFLICT(id) DO UPDATE SET home = excluded.home, reported_at = excluded.reported_at, source = excluded.source",
+        )
+          .bind(home ? 1 : 0, reportedAt, source)
+          .run(),
+      );
+      return Response.json({ ok: true, home, reportedAt });
+    }
+
     // Manual car controls. A /car/start here is an OWNER action: the next
     // tick sees a charge the system didn't start and backs off (invariant 6).
     if ((url.pathname === "/car/start" || url.pathname === "/car/stop") && req.method === "POST") {
       if (req.headers.get("authorization") !== `Bearer ${env.ADMIN_KEY}`) {
         return new Response("forbidden", { status: 403 });
       }
-      const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
+      const car = carFromEnv(env);
       const action = url.pathname === "/car/start" ? "manual_api_start" : "manual_api_stop";
-      if (url.pathname === "/car/start") await tessie.startCharging();
-      else await tessie.stopCharging();
+      if (url.pathname === "/car/start") await car.startCharging();
+      else await car.stopCharging();
       await env.DB.prepare(
         "INSERT INTO decisions (ts, state_from, state_to, action, inputs_json) VALUES (?,?,?,?,?)",
       )
@@ -140,6 +177,20 @@ export default {
       const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
       try {
         return Response.json(await foxess.rawRealTime());
+      } catch (err) {
+        return new Response(err instanceof Error ? err.message : String(err), { status: 502 });
+      }
+    }
+
+    // Raw car-provider state payload, for checking response shapes
+    // (Teslascope's are unverified live — see src/clients/teslascope.ts).
+    if (url.pathname === "/debug/car") {
+      if (req.headers.get("authorization") !== `Bearer ${env.ADMIN_KEY}`) {
+        return new Response("forbidden", { status: 403 });
+      }
+      try {
+        const car = carFromEnv(env);
+        return Response.json({ provider: car.name, raw: await car.rawState() });
       } catch (err) {
         return new Response(err instanceof Error ? err.message : String(err), { status: 502 });
       }
@@ -166,7 +217,7 @@ export async function runTick(
   env: Env,
   site: Site,
   foxess: FoxEssClient,
-  tessie: TessieClient,
+  carApi: CarClient,
   local: Date,
 ): Promise<void> {
   const date = local.toISOString().slice(0, 10);
@@ -180,10 +231,10 @@ export async function runTick(
   if (Number.isNaN(home.lat) || Number.isNaN(home.lon)) throw new Error("config home_lat/home_lon missing");
   const shadowMode = cfg.get("shadow_mode") !== "false"; // default ON: act only when explicitly enabled
 
-  let car: Awaited<ReturnType<TessieClient["getCarState"]>>;
+  let car: CarState;
   let house: Awaited<ReturnType<FoxEssClient["getRealTime"]>>;
   try {
-    [car, house] = await Promise.all([tessie.getCarState(), foxess.getRealTime()]);
+    [car, house] = await Promise.all([carApi.getCarState(), foxess.getRealTime()]);
   } catch (err) {
     await recordReadFailure(env, err);
     return; // state untouched; floor + car limit are the hardware backstops
@@ -207,8 +258,22 @@ export async function runTick(
         )
       ).results;
 
-  const atHome =
-    car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= site.homeRadiusM;
+  // Invariant 7 gate. Unknown GPS, or a missing/stale/absent bluetooth
+  // report, counts as NOT home.
+  const homeDetection = parseHomeDetection(cfg.get("home_detection"));
+  let presence: PresenceReport | null = null;
+  if (homeDetection !== "gps") {
+    const row = await d1Retry(() =>
+      env.DB.prepare("SELECT home, reported_at FROM presence WHERE id = 1").first<{
+        home: number;
+        reported_at: string;
+      }>(),
+    );
+    presence = row ? { home: row.home === 1, reportedAtMs: Date.parse(row.reported_at) } : null;
+  }
+  const atGps = gpsHome(car.latLon, home, site.homeRadiusM);
+  const atBluetooth = bluetoothHome(presence, Date.now());
+  const atHome = isHome(homeDetection, atGps, atBluetooth);
 
   // PLAN-time read-only hardware-floor read, BEFORE decide: the house's
   // forecast energy is reserved on top of minSocOnGrid. Only the FoxESS
@@ -256,12 +321,12 @@ export async function runTick(
   if (!shadowMode) {
     for (const act of actions) {
       if (act.kind === "start_charging") {
-        await tessie.startCharging();
-        await tessie.setChargingAmps(act.amps);
+        await carApi.startCharging();
+        await carApi.setChargingAmps(act.amps);
       } else if (act.kind === "stop_charging") {
-        await tessie.stopCharging();
+        await carApi.stopCharging();
       } else if (act.kind === "set_amps") {
-        await tessie.setChargingAmps(act.amps);
+        await carApi.setChargingAmps(act.amps);
       } else {
         await notify(env, act.message);
       }
@@ -278,7 +343,16 @@ export async function runTick(
           stored?.state ?? "PLAN",
           next.state,
           prefix + (actions.length ? actions.map(describeAction).join(" | ") : "none"),
-          JSON.stringify({ nowMins, car: inputs.car, house, cfg: inputs.cfg, floorPct, before: stored, after: next }),
+          JSON.stringify({
+            nowMins,
+            car: inputs.car,
+            home: { mode: homeDetection, gps: atGps, bluetooth: atBluetooth, presence },
+            house,
+            cfg: inputs.cfg,
+            floorPct,
+            before: stored,
+            after: next,
+          }),
         )
         .run(),
     );
@@ -340,7 +414,7 @@ async function recordReadFailure(env: Env, err: unknown): Promise<void> {
 }
 
 /** Pull yesterday's (local) load history into load_samples, dropping
- *  slots that overlap a home charging session (Tessie charge history sees
+ *  slots that overlap a home charging session (the car API's charge history sees
  *  ALL charges, including outside the tick window — the sessions table
  *  cannot). Fails loud: a day with unfilterable EV load must not enter the
  *  forecast. */
@@ -348,27 +422,32 @@ export async function pullYesterdayLoad(
   env: Env,
   site: Site,
   foxess: FoxEssClient,
-  tessie: TessieClient,
+  car: CarClient,
   local: Date,
 ): Promise<void> {
   const date = addDays(local.toISOString().slice(0, 10), -1);
   const home = await homeCoords(env);
   const dayMs = localMidnightMs(site, date);
-  const charges = await tessie.getCharges((dayMs - 86_400_000) / 1000, (dayMs + 2 * 86_400_000) / 1000);
-  await pullDayLoad(env, site, foxess, date, excludedSlots(charges, home, date, Date.now(), site));
+  const charges = car.getCharges
+    ? await car.getCharges((dayMs - 86_400_000) / 1000, (dayMs + 2 * 86_400_000) / 1000)
+    : null;
+  await pullDayLoad(env, site, foxess, date, charges && excludedSlots(charges, home, date, Date.now(), site));
 }
 
-/** Pull one local day (YYYY-MM-DD) of load history into load_samples. */
+/** Pull one local day (YYYY-MM-DD) of load history into load_samples.
+ *  exclude null = the car API has no charge history (TeslaFi): drop
+ *  car-sized load spikes instead (spikeSlots). */
 export async function pullDayLoad(
   env: Env,
   site: Site,
   foxess: FoxEssClient,
   date: string,
-  exclude: Set<number>,
+  exclude: Set<number> | null,
 ): Promise<void> {
   const rows = await foxess.pullDailyLoadHistory(date, site);
   if (rows.length === 0) throw new Error(`no load samples returned for ${date}`);
-  const kept = rows.filter((r) => !exclude.has(r.slot));
+  const drop = exclude ?? spikeSlots(rows, site);
+  const kept = rows.filter((r) => !drop.has(r.slot));
   const stmt = env.DB.prepare(
     "INSERT INTO load_samples (date, slot_half_hour, load_kwh) VALUES (?, ?, ?)",
   );
@@ -395,6 +474,13 @@ async function homeCoords(env: Env): Promise<{ lat: number; lon: number }> {
     throw new Error("config home_lat/home_lon missing (seed them per README 'Setup')");
   }
   return { lat, lon };
+}
+
+/** home=true|false|1|0 (string from a query, or a JSON boolean/number). */
+function parsePresent(v: unknown): boolean | null {
+  if (v === true || v === 1 || v === "true" || v === "1") return true;
+  if (v === false || v === 0 || v === "false" || v === "0") return false;
+  return null;
 }
 
 function nextDay(date: string): string {

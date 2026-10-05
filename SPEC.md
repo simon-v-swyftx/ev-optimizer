@@ -53,6 +53,24 @@ not an idle away plug. Location missing or malformed → treat as NOT home,
 do nothing, log; alert once if that persists 3+ ticks while the car reports
 plugged in. "Plugged in" everywhere in this spec means plugged in at home.
 
+Bluetooth presence (added 2026-10-05, src/presence.ts): a device at home
+(scripts/ble-presence.py on a Pi, or Home Assistant / any automation) POSTs
+`/presence` (Bearer PRESENCE_KEY; `home=true|false` as query or JSON body,
+optional `source`) whenever it does or doesn't see the car's BLE
+advertisement. One row in the `presence` table, stamped with the Worker's
+clock. D1 config `home_detection` picks the gate:
+  gps (default)      — GPS geofence only (behaviour before bluetooth)
+  bluetooth          — fresh "home" report only; for car APIs with no or
+                       privacy-blurred location
+  gps_or_bluetooth   — either; covers GPS drift in a garage
+  gps_and_bluetooth  — both; strictest
+A report counts only while ≤ PRESENCE_MAX_AGE_MINS (15) old, so a dead
+scanner decays to NOT home — the same fail-safe as an unknown location. An
+unknown home_detection value fails the tick (alert) rather than silently
+switching signal. Every decision row logs {mode, gps, bluetooth, presence}.
+home_lat/home_lon stay required in every mode: the nightly charge
+exclusion still geofences charge-history locations.
+
 The house reserve is enforced in HARDWARE: `minSocOnGrid` on the FoxESS
 Self-Use scheduler group (statically set by the owner — see PLAN). A dead
 controller cannot drain the house. The software detects "battery hit the
@@ -406,6 +424,68 @@ default (trades overnight house autonomy for car charge).
   battery_level, charge_limit_soc, charging_state, charge_port_latch and
   charge_amps without waking the car.
 
+## Teslascope integration (alternative car provider, added 2026-10-05)
+
+- Selected instead of Tessie by setting TESLASCOPE_TOKEN +
+  TESLASCOPE_VEHICLE_ID (src/clients/car.ts `carFromEnv`). Both providers'
+  tokens set, or neither, is a config error: the Worker idles and alerts
+  hourly, it never picks one.
+- Base https://teslascope.com/api, `Authorization: Bearer <personal access
+  token>`. Per-vehicle paths use the Teslascope public ID, not the VIN.
+- Reads: GET /vehicle/{id}/detailed — Teslascope's last-polled state
+  (does not wake the car); Fleet-API-shaped charge_state / drive_state, so
+  the same fields as Tessie. charging_state is preferred; if absent,
+  detailed_charge_state ("DetailedChargeStateCharging") is mapped by
+  stripping the prefix. An optional { response: … } envelope is unwrapped.
+- Commands: POST /vehicle/{id}/command/startCharging | stopCharging
+  (verified via the openHAB Teslascope binding) | setChargingAmps
+  (UNVERIFIED name; sends both `amps` and `charging_amps` query params).
+  A non-2xx throws, so a rejected amps command fails the tick loudly.
+- Charge history: GET /vehicle/{id}/charging-history, filtered to the
+  requested range client-side. Shape UNVERIFIED: the client accepts the
+  plausible spellings (started_at/start_date/…; unix s/ms or a zoned ISO
+  string) and fails loud otherwise; zoneless date strings are rejected
+  (Workers would read them as UTC). RISK: Teslascope documents this as
+  "supercharging (and related)" history. If it omits home AC sessions,
+  home charges are NOT excluded from load_samples and inflate the
+  forecast (a too-high reserve: suboptimal, never unsafe). After the first
+  /backfill, run the residual-spike SQL check under "Backfill" above.
+- GET /debug/car (ADMIN_KEY) returns the provider name and the raw state
+  payload, for checking these shapes before leaving shadow mode.
+
+## TeslaFi integration (alternative car provider, added 2026-10-05)
+
+- Selected by setting TESLAFI_TOKEN (Settings → Tesla API → API Token).
+  The token is per vehicle, so there is no VIN secret. Same one-provider
+  rule as above.
+- No public API document (teslafi.com/api.php is account-only). Ported
+  from two open-source integrations: Sentry-USB run/awake_start (the
+  "SentrySix" keep-awake code) and Home Assistant's jhansche/ha-teslafi.
+  Not yet live-tested here.
+- Single endpoint GET https://www.teslafi.com/feed.php?command=…, with
+  `Authorization: Bearer <token>`.
+- Reads: command=lastGood — TeslaFi's last logged data point with charge
+  data (does not wake the car). Flat Fleet-API field names, values often
+  strings: battery_level, charge_limit_soc, charging_state,
+  charge_current_request (= the set amps), latitude, longitude.
+- Commands: charge_start | charge_stop | set_charging_amps&charging_amps=N,
+  each with wake=30 (TeslaFi wakes a sleeping car and waits up to 30 s).
+  Each must be ticked under Settings → Tesla API → Commands.
+- Failure shapes, all thrown: non-2xx; a 200 with plain text ("This
+  command is not enabled…", "Vehicle is asleep or unavailable…"); a JSON
+  {error, error_description}; response.result anything but true (false,
+  "unauthorized").
+- No charge-history call. The nightly pull and /backfill instead drop
+  every half-hour slot averaging ≥ the car's minimum draw (CHARGER_MIN_AMPS
+  × volts × phases; 3.45 kW = 1.725 kWh/slot on the reference install),
+  plus its neighbours for the partial start/end slots (src/charges.ts
+  spikeSlots). Same stance as "Nightly job": over-exclude rather than bake
+  ~10 kW of charger into the forecast. Known errors: a genuine house load
+  that big is dropped (its slot falls back to other days or the 1 kW
+  bootstrap, so the reserve can run low there; the safety factor and the
+  minSocOnGrid floor absorb it), and a charge shorter than a slot can slip
+  through. Run the residual-spike SQL check after the first backfill.
+
 ## Reference install (confirmed 2026-07-04)
 
 The facts the reference install's tuning was derived from. Yours will
@@ -434,7 +514,10 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
   evening_dump flag, solar_track flag (default on), solar_soak flag
   (default on), shadow_mode flag
   (default ON — commands only sent when explicitly 'false'), home_lat/
-  home_lon (geofence), operating window
+  home_lon (geofence), home_detection (gps | bluetooth | gps_or_bluetooth
+  | gps_and_bluetooth, default gps), operating window
+- presence(id = 1, home INT, reported_at TEXT, source TEXT) — latest
+  bluetooth / webhook car-presence report (migration 0003)
 - days(date TEXT PK, reserve_pct INT, planned_at TEXT, state TEXT)
 - decisions(id, ts, state_from, state_to, action, inputs_json) — every tick
   that does anything writes a row
