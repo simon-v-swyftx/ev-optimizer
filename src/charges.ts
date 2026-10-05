@@ -4,7 +4,7 @@
  * Pure functions — keep them exhaustively testable.
  */
 
-import { localMidnightMs, type Site } from "./site";
+import { addDays, localMidnightMs, localSlot, type Site } from "./site";
 
 const SLOT_MS = 30 * 60 * 1000;
 
@@ -34,9 +34,10 @@ export function excludedSlots(
   home: { lat: number; lon: number },
   date: string,
   nowMs: number,
-  site: Pick<Site, "tzOffsetMins" | "homeRadiusM">,
+  site: Pick<Site, "timeZone" | "homeRadiusM">,
 ): Set<number> {
   const dayStart = localMidnightMs(site, date);
+  const dayEnd = localMidnightMs(site, addDays(date, 1)); // 23/24/25 h (DST)
   const out = new Set<number>();
   for (const c of charges) {
     if (
@@ -47,9 +48,10 @@ export function excludedSlots(
       continue; // away charge: no effect on house loadsPower
     }
     const end = c.endedAtMs ?? nowMs;
-    for (let slot = 0; slot < 48; slot++) {
-      const slotStart = dayStart + slot * SLOT_MS;
-      if (c.startedAtMs < slotStart + SLOT_MS && end > slotStart) out.add(slot);
+    // Step real half hours and label each by its wall-clock slot, matching
+    // how FoxESS samples are bucketed (by their local time string).
+    for (let t = dayStart; t < dayEnd; t += SLOT_MS) {
+      if (c.startedAtMs < t + SLOT_MS && end > t) out.add(localSlot(site, t));
     }
   }
   return out;

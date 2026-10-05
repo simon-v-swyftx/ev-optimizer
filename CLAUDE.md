@@ -24,7 +24,7 @@ need, and anything above it glides into the car by 11:00.
 
 Per-install facts are Worker `vars` in wrangler.jsonc, parsed and validated
 by src/site.ts and passed into the pure state machine as `DecideInputs.site`.
-Never hard-code them in logic: UTC_OFFSET, FREE_WINDOW_START/END, DAY_START,
+Never hard-code them in logic: TIME_ZONE, FREE_WINDOW_START/END, DAY_START,
 SOLAR_SOAK_END, BATTERY_KWH, BATTERY_MIN_SOC,
 CHARGER_VOLTS/PHASES/MIN_AMPS/MAX_AMPS, HOME_RADIUS_M. Thresholds that scale
 with the hardware (floor-hit import, solar resume surplus) are derived from
@@ -39,7 +39,7 @@ src/testing.ts):
 - Car: Tesla Model Y LR, three-phase 11 kW AC charging (16 A/phase; 1 A step ≈ 690 W)
 - Solar: 6.6 kW rated, split east/west roofs — rarely near rated output; PV
   alone can almost never cover house load + the car's 3.45 kW minimum
-- Free grid window: 11:00–14:00 local, UTC+10 with NO daylight saving
+- Free grid window: 11:00–14:00 local, Australia/Brisbane (UTC+10, no DST)
 - Battery always reaches 100% by end of the free window (owner-verified)
 
 ## Non-negotiable safety invariants
@@ -56,8 +56,9 @@ src/testing.ts):
    SoC. Do not track a separate target.
 4. After sending `start_charging`, verify on the next tick that the car
    reports Charging. Commands are not confirmations.
-5. All time handling in local time at the fixed UTC_OFFSET, no DST — do not
-   add DST logic or timezone libraries.
+5. All time handling in local wall-clock time in the IANA TIME_ZONE, DST
+   included, via the runtime's built-in Intl (src/site.ts) — no timezone
+   libraries. A DST day is 23 or 25 h: never assume 24 h or 48 slots/day.
 6. Never stop a charging session the system did not start. The owner's
    Tesla-app start button is the deliberate manual override (e.g. paid grid
    charge before a long drive); back off and send one ntfy note.

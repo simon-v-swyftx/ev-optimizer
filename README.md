@@ -25,9 +25,9 @@ You need:
   schedule yourself in the FoxESS app.
 - **A Tesla on a [Tessie](https://tessie.com) account.** Tessie signs the
   commands and serves cached state without waking the car.
-- **A daily free or cheap grid window** at the same time each day.
-- **A fixed UTC offset.** The design has no daylight-saving support, so it
-  does not fit as-is if your region observes DST.
+- **A daily free or cheap grid window** at the same local (wall-clock) time
+  each day. Daylight saving is handled: set `TIME_ZONE` to your IANA zone and
+  the window follows the clock change.
 - A Cloudflare account (the free tier is enough) and an
   [ntfy](https://ntfy.sh) topic for push alerts.
 
@@ -46,7 +46,7 @@ is logged to D1 with the inputs it acted on.
 There are three layers:
 
 1. **Site vars in `wrangler.jsonc`** (needs a redeploy). These describe your
-   install: `UTC_OFFSET`, `FREE_WINDOW_START`/`FREE_WINDOW_END`, `DAY_START`,
+   install: `TIME_ZONE`, `FREE_WINDOW_START`/`FREE_WINDOW_END`, `DAY_START`,
    `SOLAR_SOAK_END`, `BATTERY_KWH`, `BATTERY_MIN_SOC`, `CHARGER_VOLTS`, `CHARGER_PHASES`,
    `CHARGER_MIN_AMPS`, `CHARGER_MAX_AMPS`, `HOME_RADIUS_M`, and optionally
    `NTFY_URL` for a self-hosted ntfy server. Each one is commented in the
@@ -76,8 +76,9 @@ restarts and the solar-soak SoC limits, lives in `src/constants.ts`. The
 defaults are tuned for an 11 kW charger with a 40-odd kWh battery. Read the
 relevant SPEC.md section before changing them.
 
-Set the FoxESS device timezone in FoxESS Cloud to match `UTC_OFFSET`. The
-nightly load pull checks the timestamps and fails loudly on a mismatch.
+Set the FoxESS device timezone in FoxESS Cloud to match `TIME_ZONE`
+(including its daylight saving). The nightly load pull checks every sample's
+UTC offset against `TIME_ZONE` and fails loudly on a mismatch.
 
 ## Setup
 

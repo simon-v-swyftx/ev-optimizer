@@ -2,7 +2,7 @@
 
 Numbers and clock times in this document describe the **reference install**
 the design was developed on (see "Reference install"). On your install they
-come from the site vars in `wrangler.jsonc` (`UTC_OFFSET`,
+come from the site vars in `wrangler.jsonc` (`TIME_ZONE`,
 `FREE_WINDOW_START`/`END`, `DAY_START`, `SOLAR_SOAK_END`, `BATTERY_KWH`,
 `BATTERY_MIN_SOC`, charger volts/phases/amps, `HOME_RADIUS_M`) — read
 "11:00" as "free-window start", "14:00" as "free-window end", "05:30" as
@@ -321,8 +321,11 @@ default (trades overnight house autonomy for car charge).
   begin/end in ms, span ≤ 24 h; sample times are inverter-LOCAL strings
   ("2026-07-03 00:02:33 AEST+1000" on a UTC+10 install) at ~5-min cadence, may over-run the
   requested day, values may be null. The client fails loud if timestamps
-  don't carry the configured UTC_OFFSET — a wrong cloud-side device timezone would otherwise silently
-  phase-shift every slot.
+  don't carry TIME_ZONE's UTC offset for that instant (DST-aware) — a wrong cloud-side device timezone would otherwise silently
+  phase-shift every slot. Slots are wall-clock half hours: on the 23-h day DST
+  starts the skipped hour's slots are absent; on the 25-h day it ends the
+  repeated hour's samples share their slots, and the 24-h query cap drops
+  that day's last hour (those slots average over fewer days).
 - Error codes: 40256 bad headers/signature, 40257 bad body, 40400 rate
   limit, 44096 "cannot update settings when schedule is active" — any future
   setting write must go through the scheduler endpoints while a schedule is
@@ -340,7 +343,7 @@ default (trades overnight house autonomy for car charge).
   The owner may manually skip the evening export before a long drive; that
   stays a manual FoxESS-app action (no calendar awareness).
 - Nightly job (LIVE since 2026-07-04; 01:00 local, run from the 5-min cron so
-  no cron edit is needed for a different UTC_OFFSET):
+  no cron edit is needed for a different TIME_ZONE or a DST change):
   pull yesterday's loadsPower into half-hour `load_samples`.
   NOTE: loadsPower INCLUDES the EV charger (verified: the owner's manual
   midnight charge showed as ~10 kW in slot 0 on 2026-07-03). Charge

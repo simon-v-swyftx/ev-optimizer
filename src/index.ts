@@ -9,7 +9,7 @@ import {
   NIGHTLY_PULL_MINS,
   TICK_TAIL_MINS,
 } from "./constants";
-import { localMidnightMs, localNow, siteFromEnv, type Site, type SiteVars } from "./site";
+import { addDays, localMidnightMs, localNow, siteFromEnv, type Site, type SiteVars } from "./site";
 
 export interface Env extends SiteVars {
   DB: D1Database;
@@ -22,8 +22,8 @@ export interface Env extends SiteVars {
   ADMIN_KEY: string; // bearer for admin HTTP routes (/backfill, step-3 endpoints)
 }
 
-// Local time is a fixed UTC offset (UTC_OFFSET var), no DST (invariant 5).
-// Do not add timezone libraries.
+// Local time is TIME_ZONE wall-clock time, DST included (invariant 5): the
+// runtime's built-in Intl data, no timezone libraries.
 const localMins = (local: Date) => local.getUTCHours() * 60 + local.getUTCMinutes();
 
 function withinOperatingWindow(local: Date, site: Site): boolean {
@@ -351,7 +351,7 @@ export async function pullYesterdayLoad(
   tessie: TessieClient,
   local: Date,
 ): Promise<void> {
-  const date = new Date(local.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const date = addDays(local.toISOString().slice(0, 10), -1);
   const home = await homeCoords(env);
   const dayMs = localMidnightMs(site, date);
   const charges = await tessie.getCharges((dayMs - 86_400_000) / 1000, (dayMs + 2 * 86_400_000) / 1000);
@@ -399,10 +399,6 @@ async function homeCoords(env: Env): Promise<{ lat: number; lon: number }> {
 
 function nextDay(date: string): string {
   return addDays(date, 1);
-}
-
-function addDays(date: string, n: number): string {
-  return new Date(Date.parse(`${date}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
 }
 
 /** D1 throws transient "overloaded"/reset errors under Cloudflare-side load

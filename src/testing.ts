@@ -1,10 +1,10 @@
 import { siteFromEnv } from "./site";
 
 /** The site the test suite's numbers were worked out against (the example
- *  vars in wrangler.jsonc): UTC+10, free window 11:00–14:00, 42 kWh battery,
+ *  vars in wrangler.jsonc): Australia/Brisbane (UTC+10, no DST), free window 11:00–14:00, 42 kWh battery,
  *  three-phase 230 V charger at 5–16 A. Test-only. */
 export const TEST_SITE = siteFromEnv({
-  UTC_OFFSET: "+10:00",
+  TIME_ZONE: "Australia/Brisbane",
   FREE_WINDOW_START: "11:00",
   FREE_WINDOW_END: "14:00",
   DAY_START: "05:30",
