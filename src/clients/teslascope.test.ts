@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { carFromEnv } from "./car";
+import { TeslaFiClient } from "./teslafi";
 import { TeslascopeClient } from "./teslascope";
 import { TessieClient } from "./tessie";
 
@@ -18,7 +19,11 @@ describe("carFromEnv", () => {
   it("refuses both tokens rather than guessing", () => {
     expect(() =>
       carFromEnv({ TESSIE_TOKEN: "t", TESSIE_VIN: "v", TESLASCOPE_TOKEN: "t", TESLASCOPE_VEHICLE_ID: "a" }),
-    ).toThrow(/both/);
+    ).toThrow(/more than one/);
+    expect(() => carFromEnv({ TESSIE_TOKEN: "t", TESSIE_VIN: "v", TESLAFI_TOKEN: "f" })).toThrow(/more than one/);
+  });
+  it("picks TeslaFi when only its token is set (no vehicle id needed)", () => {
+    expect(carFromEnv({ TESLAFI_TOKEN: "f" })).toBeInstanceOf(TeslaFiClient);
   });
   it("refuses no token", () => {
     expect(() => carFromEnv({})).toThrow(/no car API/);

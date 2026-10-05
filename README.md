@@ -23,11 +23,12 @@ You need:
   from foxesscloud.com → User Profile → API Management). The inverter should
   run Self-Use outside the free window and ForceCharge during it. You set that
   schedule yourself in the FoxESS app.
-- **A Tesla on a [Tessie](https://tessie.com) or
-  [Teslascope](https://teslascope.com) account.** Either one signs the
-  commands and serves cached state without waking the car. Teslascope
-  support is newer: run in shadow mode and check `GET /debug/car` and your
-  first `/backfill` before trusting it (see SPEC.md "Teslascope
+- **A Tesla on a [Tessie](https://tessie.com),
+  [Teslascope](https://teslascope.com) or [TeslaFi](https://www.teslafi.com)
+  account.** Any of them signs the commands and serves cached state without
+  waking the car. Teslascope and TeslaFi support is newer: run in shadow
+  mode and check `GET /debug/car` and your first `/backfill` before
+  trusting it (see SPEC.md "Teslascope integration" / "TeslaFi
   integration").
 - **A daily free or cheap grid window** at the same local (wall-clock) time
   each day. Daylight saving is handled: set `TIME_ZONE` to your IANA zone and
@@ -37,7 +38,7 @@ You need:
 
 ## How it works
 
-A cron runs every 5 minutes. Each tick reads the car (Tessie or Teslascope) and the
+A cron runs every 5 minutes. Each tick reads the car (Tessie, Teslascope or TeslaFi) and the
 inverter (FoxESS Open API) and runs a pure state machine (`src/tick.ts`). It
 then sends the resulting car commands: start, stop and set amps. The
 inverter is never written to. The FoxESS `minSocOnGrid` floor and the car's
@@ -72,9 +73,12 @@ There are three layers:
 
 3. **Secrets** (`wrangler secret put …`, with local copies in `.dev.vars`):
    `TESSIE_TOKEN` + `TESSIE_VIN` **or** `TESLASCOPE_TOKEN` +
-   `TESLASCOPE_VEHICLE_ID` (exactly one car provider; the Teslascope token
-   is a personal access token from Developers → Applications, and the
-   vehicle ID is the public ID in your vehicle's Teslascope URL),
+   `TESLASCOPE_VEHICLE_ID` **or** `TESLAFI_TOKEN` (exactly one car
+   provider). The Teslascope token is a personal access token from
+   Developers → Applications, and the vehicle ID is the public ID in your
+   vehicle's Teslascope URL. The TeslaFi token is under Settings → Tesla
+   API → API Token; on the Commands tab also tick Charge Start, Charge
+   Stop and Set Charging Amps, or TeslaFi refuses them.
    `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`,
    `NTFY_TOPIC`, `ADMIN_KEY` (the bearer token for the admin HTTP
    routes), and optionally `PRESENCE_KEY` (see "Bluetooth presence"). Pick an unguessable ntfy topic, because anyone who knows it can
@@ -119,7 +123,7 @@ pnpm exec wrangler d1 create ev_optimiser   # put the printed id in wrangler.jso
 # edit the "vars" block in wrangler.jsonc for your site
 pnpm run migrate -- --remote                # pnpm run migrate alone targets the local dev DB
 cp .dev.vars.example .dev.vars              # fill in local secrets
-pnpm exec wrangler secret put TESSIE_TOKEN  # repeat for every secret (or TESLASCOPE_*)
+pnpm exec wrangler secret put TESSIE_TOKEN  # repeat for every secret (or TESLASCOPE_* / TESLAFI_TOKEN)
 pnpm exec wrangler d1 execute ev_optimiser --remote \
   --command "INSERT INTO config (key, value) VALUES ('home_lat','<lat>'), ('home_lon','<lon>')"
 pnpm test

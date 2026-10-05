@@ -1,7 +1,7 @@
 import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
 import { FoxEssClient } from "./clients/foxess";
 import { carFromEnv, type CarClient, type CarEnv, type CarState } from "./clients/car";
-import { excludedSlots } from "./charges";
+import { excludedSlots, spikeSlots } from "./charges";
 import { bluetoothHome, gpsHome, isHome, parseHomeDetection, type PresenceReport } from "./presence";
 import {
   DEFAULT_SAFETY_FACTOR,
@@ -101,12 +101,14 @@ export default {
       const home = await homeCoords(env);
       const fromMs = localMidnightMs(site, from);
       const toMs = localMidnightMs(site, to);
-      const charges = await car.getCharges((fromMs - 86_400_000) / 1000, (toMs + 2 * 86_400_000) / 1000);
+      const charges = car.getCharges
+        ? await car.getCharges((fromMs - 86_400_000) / 1000, (toMs + 2 * 86_400_000) / 1000)
+        : null; // no charge history: pullDayLoad falls back to spikeSlots
       const ok: string[] = [];
       const failed: Record<string, string> = {};
       for (let d = from; d <= to; d = nextDay(d)) {
         try {
-          await pullDayLoad(env, site, foxess, d, excludedSlots(charges, home, d, Date.now(), site));
+          await pullDayLoad(env, site, foxess, d, charges && excludedSlots(charges, home, d, Date.now(), site));
           ok.push(d);
         } catch (err) {
           failed[d] = err instanceof Error ? err.message : String(err);
@@ -426,21 +428,26 @@ export async function pullYesterdayLoad(
   const date = addDays(local.toISOString().slice(0, 10), -1);
   const home = await homeCoords(env);
   const dayMs = localMidnightMs(site, date);
-  const charges = await car.getCharges((dayMs - 86_400_000) / 1000, (dayMs + 2 * 86_400_000) / 1000);
-  await pullDayLoad(env, site, foxess, date, excludedSlots(charges, home, date, Date.now(), site));
+  const charges = car.getCharges
+    ? await car.getCharges((dayMs - 86_400_000) / 1000, (dayMs + 2 * 86_400_000) / 1000)
+    : null;
+  await pullDayLoad(env, site, foxess, date, charges && excludedSlots(charges, home, date, Date.now(), site));
 }
 
-/** Pull one local day (YYYY-MM-DD) of load history into load_samples. */
+/** Pull one local day (YYYY-MM-DD) of load history into load_samples.
+ *  exclude null = the car API has no charge history (TeslaFi): drop
+ *  car-sized load spikes instead (spikeSlots). */
 export async function pullDayLoad(
   env: Env,
   site: Site,
   foxess: FoxEssClient,
   date: string,
-  exclude: Set<number>,
+  exclude: Set<number> | null,
 ): Promise<void> {
   const rows = await foxess.pullDailyLoadHistory(date, site);
   if (rows.length === 0) throw new Error(`no load samples returned for ${date}`);
-  const kept = rows.filter((r) => !exclude.has(r.slot));
+  const drop = exclude ?? spikeSlots(rows, site);
+  const kept = rows.filter((r) => !drop.has(r.slot));
   const stmt = env.DB.prepare(
     "INSERT INTO load_samples (date, slot_half_hour, load_kwh) VALUES (?, ?, ?)",
   );

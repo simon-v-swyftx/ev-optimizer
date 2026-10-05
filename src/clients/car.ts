@@ -1,10 +1,11 @@
 /**
  * Car API abstraction. The controller talks to the car through exactly one
- * provider per install — Tessie or Teslascope — chosen by which token
- * secret is set. Both proxy Tesla's Fleet API (command signing included);
+ * provider per install — Tessie, Teslascope or TeslaFi — chosen by which
+ * token secret is set. All proxy Tesla's Fleet API (command signing included);
  * commands are still not confirmations (invariant 4).
  */
 import type { Charge } from "../charges";
+import { TeslaFiClient } from "./teslafi";
 import { TeslascopeClient } from "./teslascope";
 import { TessieClient } from "./tessie";
 
@@ -24,8 +25,10 @@ export interface CarClient {
   startCharging(): Promise<void>;
   stopCharging(): Promise<void>;
   setChargingAmps(amps: number): Promise<void>;
-  /** Charge history overlapping [fromS, toS] (unix SECONDS). */
-  getCharges(fromS: number, toS: number): Promise<Charge[]>;
+  /** Charge history overlapping [fromS, toS] (unix SECONDS). Absent when
+   *  the provider has none (TeslaFi): the nightly pull then excludes
+   *  car-sized load spikes instead (src/charges.ts spikeSlots). */
+  getCharges?(fromS: number, toS: number): Promise<Charge[]>;
   /** Raw state payload, for /debug/car shape checks. */
   rawState(): Promise<unknown>;
 }
@@ -35,23 +38,22 @@ export interface CarEnv {
   TESSIE_VIN?: string;
   TESLASCOPE_TOKEN?: string;
   TESLASCOPE_VEHICLE_ID?: string;
+  TESLAFI_TOKEN?: string; // per-vehicle token: no VIN needed
 }
 
 /** Exactly one provider's token must be set. Ambiguity is a config error,
  *  not a silent pick: the wrong account could command the wrong car. */
 export function carFromEnv(env: CarEnv): CarClient {
-  const tessie = !!env.TESSIE_TOKEN;
-  const teslascope = !!env.TESLASCOPE_TOKEN;
-  if (tessie && teslascope) {
-    throw new Error("both TESSIE_TOKEN and TESLASCOPE_TOKEN are set; remove one");
-  }
-  if (tessie) {
+  const set = (["TESSIE_TOKEN", "TESLASCOPE_TOKEN", "TESLAFI_TOKEN"] as const).filter((k) => !!env[k]);
+  if (set.length > 1) throw new Error(`more than one car API token set (${set.join(", ")}); keep one`);
+  if (env.TESSIE_TOKEN) {
     if (!env.TESSIE_VIN) throw new Error("TESSIE_VIN missing");
-    return new TessieClient(env.TESSIE_TOKEN!, env.TESSIE_VIN);
+    return new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
   }
-  if (teslascope) {
+  if (env.TESLASCOPE_TOKEN) {
     if (!env.TESLASCOPE_VEHICLE_ID) throw new Error("TESLASCOPE_VEHICLE_ID missing");
-    return new TeslascopeClient(env.TESLASCOPE_TOKEN!, env.TESLASCOPE_VEHICLE_ID);
+    return new TeslascopeClient(env.TESLASCOPE_TOKEN, env.TESLASCOPE_VEHICLE_ID);
   }
-  throw new Error("no car API configured: set TESSIE_TOKEN or TESLASCOPE_TOKEN");
+  if (env.TESLAFI_TOKEN) return new TeslaFiClient(env.TESLAFI_TOKEN);
+  throw new Error("no car API configured: set TESSIE_TOKEN, TESLASCOPE_TOKEN or TESLAFI_TOKEN");
 }

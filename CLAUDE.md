@@ -1,6 +1,6 @@
 # EV + Home Battery Charge Optimiser
 
-Cloudflare Worker that optimises charging of a Tesla (via Tessie or Teslascope) from a
+Cloudflare Worker that optimises charging of a Tesla (via Tessie, Teslascope or TeslaFi) from a
 FoxESS home battery, exploiting a daily free grid-power window (11:00–14:00
 on the reference install; configurable).
 
@@ -83,6 +83,10 @@ src/testing.ts):
   - Teslascope API (https://teslascope.com/api, personal-access-token
     bearer, per-vehicle public ID) — amps command name and charging-history
     shape are NOT yet live-verified; see src/clients/teslascope.ts
+  - TeslaFi (https://www.teslafi.com/feed.php?command=…, per-vehicle
+    bearer token) — ported from Sentry-USB and ha-teslafi, not yet
+    live-tested; no charge history, so the nightly pull drops car-sized
+    load spikes instead (src/charges.ts spikeSlots)
 - Inverter: FoxESS Open API (https://www.foxesscloud.com/public/i18n/en/OpenApiDocument.html)
   — API-key auth with an MD5 request signature; rate limit 1,440 calls/day
 - Alerts: ntfy.sh topic (push to phone)
@@ -104,7 +108,7 @@ The repo is pnpm-managed (since 2026-07-04) — use `pnpm add`, never
 ## Secrets (wrangler secret put …)
 
 - `TESSIE_TOKEN`, `TESSIE_VIN` — or `TESLASCOPE_TOKEN`,
-  `TESLASCOPE_VEHICLE_ID` (exactly one provider)
+  `TESLASCOPE_VEHICLE_ID` — or `TESLAFI_TOKEN` (exactly one provider)
 - `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`
 - `NTFY_TOPIC` (optional var `NTFY_URL` for a self-hosted ntfy server)
 - `PRESENCE_KEY` (optional) — bearer for `POST /presence`, the bluetooth /

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { excludedSlots, haversineM } from "./charges";
+import { excludedSlots, haversineM, spikeSlots } from "./charges";
 import { TEST_SITE } from "./testing";
 
 // Arbitrary test coordinates (a city centre) — the real geofence lives in D1 config.
@@ -96,5 +96,29 @@ describe("haversineM", () => {
     expect(haversineM(HOME.lat, HOME.lon, HOME.lat, HOME.lon)).toBe(0);
     expect(haversineM(0, 0, 1, 0)).toBeGreaterThan(110_000);
     expect(haversineM(0, 0, 1, 0)).toBeLessThan(112_000);
+  });
+});
+
+describe("spikeSlots", () => {
+  // TEST_SITE: 5 A x 690 W = 3.45 kW minimum draw -> 1.725 kWh per half hour.
+  it("excludes car-sized slots and their neighbours", () => {
+    const rows = [
+      { slot: 10, loadKwh: 0.4 },
+      { slot: 11, loadKwh: 0.9 }, // partial slot as a charge starts
+      { slot: 12, loadKwh: 5.8 },
+      { slot: 13, loadKwh: 5.8 },
+      { slot: 14, loadKwh: 1.2 }, // partial slot as it ends
+      { slot: 15, loadKwh: 0.4 },
+    ];
+    expect([...spikeSlots(rows, TEST_SITE)].sort((a, b) => a - b)).toEqual([11, 12, 13, 14]);
+  });
+
+  it("keeps ordinary house load", () => {
+    const rows = Array.from({ length: 48 }, (_, slot) => ({ slot, loadKwh: 1.7 }));
+    expect(spikeSlots(rows, TEST_SITE).size).toBe(0);
+  });
+
+  it("threshold is inclusive and slot 0 has no negative neighbour", () => {
+    expect([...spikeSlots([{ slot: 0, loadKwh: 1.725 }], TEST_SITE)].sort()).toEqual([0, 1]);
   });
 });

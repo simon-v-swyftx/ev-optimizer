@@ -453,6 +453,39 @@ default (trades overnight house autonomy for car charge).
 - GET /debug/car (ADMIN_KEY) returns the provider name and the raw state
   payload, for checking these shapes before leaving shadow mode.
 
+## TeslaFi integration (alternative car provider, added 2026-10-05)
+
+- Selected by setting TESLAFI_TOKEN (Settings → Tesla API → API Token).
+  The token is per vehicle, so there is no VIN secret. Same one-provider
+  rule as above.
+- No public API document (teslafi.com/api.php is account-only). Ported
+  from two open-source integrations: Sentry-USB run/awake_start (the
+  "SentrySix" keep-awake code) and Home Assistant's jhansche/ha-teslafi.
+  Not yet live-tested here.
+- Single endpoint GET https://www.teslafi.com/feed.php?command=…, with
+  `Authorization: Bearer <token>`.
+- Reads: command=lastGood — TeslaFi's last logged data point with charge
+  data (does not wake the car). Flat Fleet-API field names, values often
+  strings: battery_level, charge_limit_soc, charging_state,
+  charge_current_request (= the set amps), latitude, longitude.
+- Commands: charge_start | charge_stop | set_charging_amps&charging_amps=N,
+  each with wake=30 (TeslaFi wakes a sleeping car and waits up to 30 s).
+  Each must be ticked under Settings → Tesla API → Commands.
+- Failure shapes, all thrown: non-2xx; a 200 with plain text ("This
+  command is not enabled…", "Vehicle is asleep or unavailable…"); a JSON
+  {error, error_description}; response.result anything but true (false,
+  "unauthorized").
+- No charge-history call. The nightly pull and /backfill instead drop
+  every half-hour slot averaging ≥ the car's minimum draw (CHARGER_MIN_AMPS
+  × volts × phases; 3.45 kW = 1.725 kWh/slot on the reference install),
+  plus its neighbours for the partial start/end slots (src/charges.ts
+  spikeSlots). Same stance as "Nightly job": over-exclude rather than bake
+  ~10 kW of charger into the forecast. Known errors: a genuine house load
+  that big is dropped (its slot falls back to other days or the 1 kW
+  bootstrap, so the reserve can run low there; the safety factor and the
+  minSocOnGrid floor absorb it), and a charge shorter than a slot can slip
+  through. Run the residual-spike SQL check after the first backfill.
+
 ## Reference install (confirmed 2026-07-04)
 
 The facts the reference install's tuning was derived from. Yours will
