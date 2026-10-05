@@ -1,4 +1,4 @@
-import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
+import { decide, parseGlideMode, type Action, type DecideInputs, type StoredState } from "./tick";
 import { FoxEssClient } from "./clients/foxess";
 import { carFromEnv, type CarClient, type CarEnv, type CarState } from "./clients/car";
 import { excludedSlots, spikeSlots } from "./charges";
@@ -309,7 +309,9 @@ export async function runTick(
       safetyFactor: Number(cfg.get("safety_factor") ?? DEFAULT_SAFETY_FACTOR),
       strandedMinPct: Number(cfg.get("stranded_min_pct") ?? DEFAULT_STRANDED_MIN_PCT),
       solarTrack: cfg.get("solar_track") !== "false",
+      glideMode: parseGlideMode(cfg.get("glide_mode")),
       solarSoak: cfg.get("solar_soak") !== "false",
+      soakExport: cfg.get("soak_export") !== "false",
       shadowMode,
     },
     samples,

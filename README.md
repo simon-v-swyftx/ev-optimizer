@@ -22,7 +22,9 @@ You need:
 - **A FoxESS hybrid inverter and battery** with Open API access (an API key
   from foxesscloud.com → User Profile → API Management). The inverter should
   run Self-Use outside the free window and ForceCharge during it. You set that
-  schedule yourself in the FoxESS app.
+  schedule yourself in the FoxESS app. The inverter must feed the same
+  phases the charger draws from: a single-phase inverter cannot cover a
+  three-phase charger, whatever the amps.
 - **A Tesla on a [Tessie](https://tessie.com),
   [Teslascope](https://teslascope.com) or [TeslaFi](https://www.teslafi.com)
   account.** Any of them signs the commands and serves cached state without
@@ -53,12 +55,16 @@ There are three layers:
 1. **Site vars in `wrangler.jsonc`** (needs a redeploy). These describe your
    install: `TIME_ZONE`, `FREE_WINDOW_START`/`FREE_WINDOW_END`, `DAY_START`,
    `SOLAR_SOAK_END`, `BATTERY_KWH`, `BATTERY_MIN_SOC`, `CHARGER_VOLTS`, `CHARGER_PHASES`,
-   `CHARGER_MIN_AMPS`, `CHARGER_MAX_AMPS`, `HOME_RADIUS_M`, and optionally
-   `NTFY_URL` for a self-hosted ntfy server. Each one is commented in the
-   file. **All of them are required.** If one is missing or malformed, the
-   Worker does nothing and sends an alert. It never falls back to someone
-   else's values. The committed values are an example install, so change
-   them.
+   `CHARGER_MIN_AMPS`, `CHARGER_MAX_AMPS`, `HOME_RADIUS_M`, `INVERTER_MAX_W`
+   (the most AC power the inverter can put out from the battery; the
+   morning dump opens at what fits under it after house load, so a small
+   inverter is not asked for 11 kW), and optionally `EXPORT_LIMIT_W` (your
+   grid export limit, `0` for a zero-export site; only read when
+   `soak_export` is off) and `NTFY_URL` for a self-hosted ntfy server. Each
+   one is commented in the file. **All but the optional two are required.**
+   If one is missing or malformed, the Worker does nothing and sends an
+   alert. It never falls back to someone else's values. The committed
+   values are an example install, so change them.
 2. **The D1 `config` table** (no redeploy needed):
 
    | key                | default  | meaning                                                         |
@@ -68,7 +74,9 @@ There are three layers:
    | `safety_factor`    | `1.3`    | Multiplier on the forecast house load for the morning reserve.  |
    | `stranded_min_pct` | `30`     | Below this car SoC, a paid charge is left running after the window. |
    | `solar_track`      | on       | Morning PV tracking below the reserve (`'false'` to disable).   |
+   | `glide_mode`       | `asap`   | Morning restarts once the battery has banked energy above the reserve: `asap` restarts as soon as it covers 20 minutes of the car's minimum draw (more stop/start cycles, less stranded if you leave early); `continuous` waits until it can carry the car to the free window in one run. |
    | `solar_soak`       | on       | Afternoon solar soak after the window (`'false'` to disable).   |
+   | `soak_export`      | on       | The afternoon soak may also take PV that would be exported (right when exporting costs you, or pays nothing). `'false'` = only PV the inverter is curtailing; needs `EXPORT_LIMIT_W`. |
    | `home_detection`   | `gps`    | How "car is home" is decided: `gps`, `bluetooth`, `gps_or_bluetooth` or `gps_and_bluetooth`. See "Bluetooth presence". |
 
 3. **Secrets** (`wrangler secret put …`, with local copies in `.dev.vars`):

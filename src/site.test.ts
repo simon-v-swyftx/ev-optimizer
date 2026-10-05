@@ -17,6 +17,7 @@ const vars: SiteVars = {
   CHARGER_MIN_AMPS: "5",
   CHARGER_MAX_AMPS: "16",
   HOME_RADIUS_M: "150",
+  INVERTER_MAX_W: "15000",
 };
 
 describe("siteFromEnv", () => {
@@ -39,13 +40,23 @@ describe("siteFromEnv", () => {
       minAmps: 5,
       maxAmps: 16,
       homeRadiusM: 150,
+      inverterMaxW: 15000,
+      exportLimitW: null,
     });
     expect(siteFromEnv({ ...vars, BATTERY_KWH: 13.5, CHARGER_PHASES: 1 }).wPerAmp).toBe(230);
   });
 
+  it("EXPORT_LIMIT_W is optional: unset/blank = null, 0 = zero-export site, negative rejected", () => {
+    expect(siteFromEnv({ ...vars, EXPORT_LIMIT_W: "" }).exportLimitW).toBeNull();
+    expect(siteFromEnv({ ...vars, EXPORT_LIMIT_W: 0 }).exportLimitW).toBe(0);
+    expect(siteFromEnv({ ...vars, EXPORT_LIMIT_W: "5000" }).exportLimitW).toBe(5000);
+    expect(() => siteFromEnv({ ...vars, EXPORT_LIMIT_W: "-1" })).toThrow("EXPORT_LIMIT_W");
+    expect(() => siteFromEnv({ ...vars, EXPORT_LIMIT_W: "lots" })).toThrow("EXPORT_LIMIT_W");
+  });
+
   it("lists every missing var instead of defaulting to someone else's site", () => {
-    const { TIME_ZONE: _a, BATTERY_KWH: _b, ...rest } = vars;
-    expect(() => siteFromEnv(rest)).toThrow("missing site vars in wrangler.jsonc: TIME_ZONE, BATTERY_KWH");
+    const { TIME_ZONE: _a, BATTERY_KWH: _b, INVERTER_MAX_W: _c, ...rest } = vars;
+    expect(() => siteFromEnv(rest)).toThrow("missing site vars in wrangler.jsonc: TIME_ZONE, BATTERY_KWH, INVERTER_MAX_W");
   });
 
   it("rejects malformed values", () => {
@@ -114,7 +125,7 @@ describe("decide honours the site", () => {
     site,
     car: { pluggedIn: true, chargingState: "Stopped", socPct: 50, limitPct: 80, chargeAmps: 16, atHome: true },
     house: { socPct: 15, loadW: 400, gridImportW: 0, pvW: 0, feedinW: 0 },
-    cfg: { safetyFactor: 1.3, strandedMinPct: 30, solarTrack: true, solarSoak: true, shadowMode: false },
+    cfg: { safetyFactor: 1.3, strandedMinPct: 30, solarTrack: true, glideMode: "asap", solarSoak: true, soakExport: true, shadowMode: false },
     samples: [],
     floorPct: 10,
     stored: null,
@@ -154,7 +165,7 @@ describe("decide honours the site", () => {
     };
     // 32 A x 230 V = 7.36 kW; trigger = 72.5% rounded to 100 W = 5.3 kW. A
     // fixed 8 kW (the 11 kW reference) would never fire on this charger.
-    expect(dumping(5400)).toBe("SOLAR_TRACK");
+    expect(dumping(5400)).toBe("GLIDE");
     expect(dumping(5200)).toBe("DUMPING");
   });
 
@@ -164,7 +175,7 @@ describe("decide honours the site", () => {
     const streak = (pvW: number) => {
       const i = inputs(420, site);
       i.house = { ...i.house, socPct: 15, loadW: 400, pvW };
-      i.stored = { ...decide(inputs(415, site)).next, state: "SOLAR_TRACK" };
+      i.stored = { ...decide(inputs(415, site)).next, state: "GLIDE" };
       return decide(i).next.surplusStreak;
     };
     expect(streak(400 + 2430)).toBe(1);

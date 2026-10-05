@@ -2,10 +2,11 @@ import { morningSlotKwh, reserveAt } from "./reserve";
 import {
   AMP_STEP,
   BANK_RUN_MINS,
-  DERATE_IMPORT_W,
+  DERATE_HOLD_TICKS,
   EXPORT_MARGIN_W,
   FLOOR_IMPORT_FRACTION,
   GLIDE_BUFFER_MINS,
+  IMPORT_TOLERANCE_W,
   MAX_SOLAR_RESUMES,
   OFF_GRID_RUNNING_STATE,
   RECOVER_IMPORT_W,
@@ -35,7 +36,23 @@ import type { Site } from "./site";
  * Orchestration (reads, command execution, persistence) lives in src/index.ts.
  */
 
-export type StateName = "IDLE" | "DUMPING" | "SOLAR_TRACK" | "FREE_WINDOW" | "SOLAR_SOAK" | "DONE";
+export type StateName = "IDLE" | "DUMPING" | "GLIDE" | "FREE_WINDOW" | "SOLAR_SOAK" | "DONE";
+
+/** Morning bank-restart policy (D1 config glide_mode, see SPEC "GLIDE").
+ *  asap: restart as soon as the bank carries the car's minimum for
+ *  BANK_RUN_MINS (more cycles, less stranded if the owner leaves early).
+ *  continuous: restart only once it can carry the car to the free window
+ *  without a stop (one contactor cycle, runs straight into FREE_WINDOW). */
+export const GLIDE_MODES = ["asap", "continuous"] as const;
+export type GlideMode = (typeof GLIDE_MODES)[number];
+
+/** Unset = asap (the behaviour before the mode existed). A typo must not
+ *  silently change the restart policy, so unknown values throw. */
+export function parseGlideMode(v: string | undefined): GlideMode {
+  if (v === undefined || v === "") return "asap";
+  if ((GLIDE_MODES as readonly string[]).includes(v)) return v as GlideMode;
+  throw new Error(`config glide_mode '${v}' invalid (one of ${GLIDE_MODES.join(", ")})`);
+}
 
 export interface StoredState {
   date: string; // YYYY-MM-DD local
@@ -59,10 +76,12 @@ export interface StoredState {
   /** Last amps target we commanded; null when not charging. */
   lastAmps: number | null;
   surplusStreak: number; // consecutive ticks with pv-load >= resume threshold
-  solarResumes: number; // SOLAR_TRACK restarts today (wear cap)
+  solarResumes: number; // GLIDE restarts today (wear cap)
   manualNoted: boolean; // one ntfy per owner session
   solarVarsAlerted: boolean; // one ntfy per day for missing pv/feedin
-  highImportTicks: number; // SOLAR_TRACK sustained-import failsafe
+  highImportTicks: number; // GLIDE sustained-import failsafe
+  /** DUMPING: ticks to wait after a derate before probing back up. */
+  ampHold: number;
   soakStarts: number; // SOLAR_SOAK starts today (wear cap)
   soakHold: number; // SOLAR_SOAK ticks to wait before probing up / restarting
   soakLowTicks: number; // SOLAR_SOAK consecutive ticks at MIN_AMPS with battery discharging
@@ -76,14 +95,19 @@ export interface StoredState {
  *  them, so they are defaulted when the row is loaded mid-day. */
 const lateFields = (
   site: Site,
-): Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown" | "floorPct" | "slotKwh"> => ({
+): Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown" | "floorPct" | "slotKwh" | "ampHold"> => ({
   floorPct: site.batteryMinSocPct,
   slotKwh: null,
+  ampHold: 0,
   soakStarts: 0,
   soakHold: 0,
   soakLowTicks: 0,
   gridDown: null,
 });
+
+/** A state row persisted by a build that still called GLIDE "SOLAR_TRACK"
+ *  (renamed 2026-10-05) must keep acting as GLIDE when loaded mid-day. */
+const migrateState = (state: string): StateName => (state === "SOLAR_TRACK" ? "GLIDE" : (state as StateName));
 
 export interface DecideInputs {
   date: string;
@@ -109,7 +133,12 @@ export interface DecideInputs {
     safetyFactor: number;
     strandedMinPct: number;
     solarTrack: boolean;
+    glideMode: GlideMode; // morning bank-restart policy (default asap)
     solarSoak: boolean; // afternoon PV -> car after the window (default on)
+    /** Afternoon soak may take PV that would otherwise be exported (default
+     *  on: export costs money on the reference plan). 'false' = only PV the
+     *  inverter is curtailing, which needs the EXPORT_LIMIT_W site var. */
+    soakExport: boolean;
     shadowMode: boolean;
   };
   /** Half-hour load history for PLAN; only read on the first tick of a day. */
@@ -137,7 +166,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   // PLAN: first tick of a new day.
   const s: StoredState =
     i.stored && i.stored.date === i.date
-      ? { ...lateFields(i.site), ...i.stored }
+      ? { ...lateFields(i.site), ...i.stored, state: migrateState(i.stored.state) }
       : {
           date: i.date,
           state: "IDLE",
@@ -311,13 +340,21 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
         }
         if (soakOn && !full && i.house.pvW !== null && i.house.feedinW !== null) {
           // Throttle to the PV the meter can see instead of stopping: no
-          // contactor cycle, and the soak loop probes up from here.
+          // contactor cycle, and the soak loop probes up from here. In
+          // curtailed-only mode the export cap is kept out of reach first,
+          // so a car that would only eat export stops here instead.
           const houseW = i.house.loadW - i.car.chargeAmps * i.site.wPerAmp;
-          const target = clampAmps(i.site, Math.floor((i.house.pvW - houseW - EXPORT_MARGIN_W) / i.site.wPerAmp));
-          if (target !== s.lastAmps) a.push({ kind: "set_amps", amps: target });
-          s.lastAmps = target;
-          s.state = "SOLAR_SOAK";
-          return { actions: a, next: s };
+          const keepW = i.cfg.soakExport ? 0 : i.site.exportLimitW;
+          if (keepW !== null) {
+            const raw = Math.floor((i.house.pvW - houseW - keepW - EXPORT_MARGIN_W) / i.site.wPerAmp);
+            if (i.cfg.soakExport || raw >= i.site.minAmps) {
+              const target = clampAmps(i.site, raw);
+              if (target !== s.lastAmps) a.push({ kind: "set_amps", amps: target });
+              s.lastAmps = target;
+              s.state = "SOLAR_SOAK";
+              return { actions: a, next: s };
+            }
+          }
         }
         stop("window_end");
       }
@@ -344,132 +381,30 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     return { actions: a, next: s };
   }
 
-  // --- morning: IDLE / DUMPING / SOLAR_TRACK ---
+  // --- morning: IDLE / DUMPING / GLIDE ---
   // Transition first, then act as the resulting state in the same tick (so a
   // floor-hit at 16 A throttles immediately instead of a tick later).
   let st: StateName = s.state === "FREE_WINDOW" || s.state === "DONE" ? "IDLE" : s.state;
   if (full || s.sessionOwner === "owner" || !i.car.atHome) {
     st = "IDLE";
   } else if (st === "IDLE") {
-    st = i.house.socPct > s.reservePct ? "DUMPING" : "SOLAR_TRACK";
+    st = i.house.socPct > s.reservePct ? "DUMPING" : "GLIDE";
   } else if (st === "DUMPING") {
     if (i.house.gridImportW > floorImportW(i.site)) {
       learnFloor(); // floor hit before a SoC read caught it: reserve_hit stops the car this tick
-      st = "SOLAR_TRACK";
+      st = "GLIDE";
     } else if (i.house.socPct <= s.reservePct) {
-      st = "SOLAR_TRACK";
+      st = "GLIDE";
     }
   }
-  // No SOLAR_TRACK -> DUMPING re-entry any more (2026-09-29): energy that
-  // appears above the reserve (PV, or the reserve decaying toward 11:00) is
-  // glided into the car at a gentle rate instead of a 16 A burst.
+  // No GLIDE -> DUMPING re-entry (2026-09-29): energy that appears above the
+  // reserve (PV, or the reserve decaying toward 11:00) is glided into the
+  // car at a gentle rate instead of a 16 A burst.
   s.state = st;
+  if (st !== "DUMPING") s.ampHold = 0;
 
-  if (st === "DUMPING" && canAct) {
-    if (!charging) {
-      if (canStart()) start(i.site.maxAmps);
-    } else if (s.sessionOwner === "system") {
-      if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
-      let target = s.lastAmps;
-      if (i.house.gridImportW > DERATE_IMPORT_W) {
-        target = Math.max(i.site.minAmps, target - AMP_STEP); // battery derated/limiting
-      } else if (i.house.gridImportW < RECOVER_IMPORT_W && target < i.site.maxAmps) {
-        target = Math.min(i.site.maxAmps, target + AMP_STEP);
-      }
-      if (target !== s.lastAmps) {
-        a.push({ kind: "set_amps", amps: target });
-        s.lastAmps = target;
-      }
-    }
-  }
-
-  if (st === "SOLAR_TRACK" && canAct) {
-    const varsOk = i.house.pvW !== null && i.house.feedinW !== null;
-    // Glide (2026-09-29): spread the battery's energy above the reserve
-    // evenly until 11:00, on top of the PV, instead of leaving it idle for
-    // the free refill. One tick of buffer so the last tick doesn't overshoot.
-    const minsLeft = i.site.windowStartMins - i.nowMins;
-    const bankWh = (i.house.socPct - s.reservePct) * i.site.batteryKwh * 10;
-    const spendW = Math.max(0, bankWh) / ((minsLeft + GLIDE_BUFFER_MINS) / 60);
-    if (!varsOk) {
-      // degrade to floor-hold: stop, wait for the free window (SPEC fallback)
-      if (!s.solarVarsAlerted) {
-        a.push({ kind: "notify", message: "pvPower/feedinPower missing — solar tracking disabled, floor-hold" });
-        s.solarVarsAlerted = true;
-      }
-      if (charging && s.sessionOwner === "system") stop("solar_vars_missing");
-    } else if (charging && s.sessionOwner === "system") {
-      if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
-      if (i.house.socPct <= s.reservePct && i.house.loadW - i.house.pvW! > RESERVE_BLEED_W) {
-        // Self-Use keeps the meter at ~0 while the battery covers the car, so
-        // the amp loop below is blind to battery drain until the hardware
-        // floor. At/below reserve anything PV doesn't cover comes from the
-        // battery or paid grid — stop now (2026-07-08: the 1 A/tick ramp
-        // bled the battery from reserve to the 10% floor, then imported).
-        stop("reserve_hit");
-      } else {
-        // failsafe: if amp commands are failing and import persists, stop
-        if (i.house.gridImportW > SUSTAINED_IMPORT_W) {
-          if (++s.highImportTicks >= SUSTAINED_IMPORT_TICKS) {
-            stop("sustained_import");
-            learnFloor();
-            a.push({ kind: "notify", message: "SOLAR_TRACK: sustained grid import — stopped charge" });
-            s.highImportTicks = 0;
-          }
-        } else {
-          s.highImportTicks = 0;
-        }
-        if (s.sessionOwner === "system") {
-          // Closed loop on the meter; floor() + margin bias errors toward
-          // export. Below the battery's own reserve Self-Use routes spare PV
-          // into the battery and the meter reads ~0, so PV beyond house+car
-          // (loadW includes the car) also counts: the car follows the sun
-          // instead of the battery soaking it up. The larger of the two is
-          // never import-side, so this cannot push the car onto paid grid.
-          // Plus the glide allowance: the battery may cover up to spendW, net
-          // of what it is ALREADY discharging (energy balance, as SOLAR_SOAK)
-          // — the meter can't see that drain, so without subtracting it the
-          // allowance would ratchet the amps up every tick.
-          const surplusW = Math.max(i.house.feedinW! - i.house.gridImportW, i.house.pvW! - i.house.loadW);
-          const dischargeW = Math.max(0, i.house.feedinW! - i.house.gridImportW - (i.house.pvW! - i.house.loadW));
-          const delta = Math.floor((surplusW + spendW - dischargeW - EXPORT_MARGIN_W) / i.site.wPerAmp);
-          const target = Math.min(i.site.maxAmps, Math.max(i.site.minAmps, s.lastAmps + delta));
-          if (target === i.site.minAmps && s.lastAmps === i.site.minAmps && i.house.gridImportW > STOP_IMPORT_W) {
-            stop("below_solar_min"); // surplus can't sustain the car's 3.45 kW minimum
-            learnFloor();
-          } else if (target !== s.lastAmps) {
-            a.push({ kind: "set_amps", amps: target });
-            s.lastAmps = target;
-          }
-        }
-      }
-    } else if (!charging) {
-      // resume throttle: 15 min of sustained surplus, capped per day (wear)
-      const surplus = i.cfg.solarTrack && i.house.pvW !== null ? i.house.pvW - i.house.loadW : 0;
-      s.surplusStreak = surplus >= i.site.minAmps * i.site.wPerAmp + RESUME_HEADROOM_W ? s.surplusStreak + 1 : 0;
-      // Solar bank: PV the battery absorbed above reserve (loadsPower is
-      // house-only while the car is off). Resume as soon as that bank plus
-      // today's surplus carries the car's minimum for BANK_RUN_MINS, rather
-      // than waiting for a big refill — less morning PV is
-      // left stranded in the battery when the owner drives off, and the run
-      // ends at reserve via reserve_hit (battery above reserve covers any
-      // shortfall, so no import).
-      // Close to 11:00 the run only has to last until the window, where the
-      // car keeps charging free without a contactor cycle.
-      const runMins = Math.min(BANK_RUN_MINS, minsLeft);
-      const needWh = (Math.max(0, i.site.minAmps * i.site.wPerAmp - surplus) * runMins) / 60;
-      const banked = i.cfg.solarTrack && bankWh > 0 && bankWh >= needWh;
-      if (
-        (s.surplusStreak >= RESUME_STREAK_TICKS || banked) &&
-        s.solarResumes < MAX_SOLAR_RESUMES &&
-        canStart()
-      ) {
-        s.surplusStreak = 0;
-        s.solarResumes++;
-        start(clampAmps(i.site, Math.floor((surplus + spendW - EXPORT_MARGIN_W) / i.site.wPerAmp)));
-      }
-    }
-  }
+  if (st === "DUMPING" && canAct) morningDump(i, s, a, { charging, start, canStart });
+  if (st === "GLIDE" && canAct) morningGlide(i, s, a, { charging, stop, start, canStart, learnFloor });
 
   return { actions: a, next: s };
 }
@@ -477,6 +412,178 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
 const clampAmps = (site: Site, a: number) => Math.min(site.maxAmps, Math.max(site.minAmps, a));
 const floorImportW = (site: Site) =>
   Math.round((site.maxAmps * site.wPerAmp * FLOOR_IMPORT_FRACTION) / 100) * 100;
+
+/**
+ * The one morning formula (DUMPING and GLIDE, 2026-10-05): watts the car may
+ * add (+) or must shed (-) this tick, before the export margin.
+ *   meterW    = feedin - import            (+ export, - import; ground truth)
+ *   pvSpareW  = pv - load                  (PV the battery is absorbing — loadsPower includes the car)
+ *   allowanceW = battery power the car may draw: the inverter's whole output
+ *                in DUMPING (Infinity), the glide budget net of what the
+ *                battery already gives in GLIDE (may be negative)
+ * Importing beyond IMPORT_TOLERANCE_W: shed the import plus any battery
+ * over-draw, and ignore a positive allowance — a stale bank or a battery
+ * that can't discharge (hardware floor) must never ratchet the car up on
+ * paid grid. Otherwise take the visible surplus plus the allowance, capped
+ * by what the inverter can still deliver after everything it already
+ * supplies (INVERTER_MAX_W - load): a small inverter never opens at max
+ * amps and imports until the loop catches up. feedin/pv missing (DUMPING
+ * runs without them) degrade to the meter alone.
+ */
+function carRoomW(i: DecideInputs, allowanceW: number): number {
+  const h = i.house;
+  const meterW = (h.feedinW ?? 0) - h.gridImportW;
+  const pvSpareW = h.pvW === null ? -Infinity : h.pvW - h.loadW;
+  if (h.gridImportW > IMPORT_TOLERANCE_W) return meterW + Math.min(0, allowanceW);
+  return Math.min(i.site.inverterMaxW - h.loadW, Math.max(meterW, pvSpareW) + allowanceW);
+}
+
+/** Amps to start at for a given allowance (the car is off, so loadsPower is
+ *  house-only); clamped to the charger's range. */
+const startAmps = (i: DecideInputs, allowanceW: number) =>
+  clampAmps(i.site, Math.floor((carRoomW(i, allowanceW) - EXPORT_MARGIN_W) / i.site.wPerAmp));
+
+/** Battery -> loads by energy balance (+ = discharging), W. */
+const batteryDischargeW = (h: DecideInputs["house"]) =>
+  Math.max(0, (h.feedinW ?? 0) - h.gridImportW - ((h.pvW ?? h.loadW) - h.loadW));
+
+/**
+ * DUMPING: the battery is above the house reserve, so the car takes the
+ * inverter's whole output. Opens at what fits under INVERTER_MAX_W after
+ * house load; the meter closes the loop from there — import beyond
+ * tolerance (a battery/BMS limit the var can't know) sheds amps sized to
+ * the import, then holds DERATE_HOLD_TICKS and probes back up AMP_STEP per
+ * tick while import stays below RECOVER_IMPORT_W. Bounded hunting instead
+ * of a 16 A restart every tick.
+ */
+function morningDump(
+  i: DecideInputs,
+  s: StoredState,
+  a: Action[],
+  h: { charging: boolean; start: (amps: number) => void; canStart: () => boolean },
+): void {
+  if (!h.charging) {
+    if (h.canStart()) h.start(startAmps(i, Infinity));
+    return;
+  }
+  if (s.sessionOwner !== "system") return;
+  if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+  if (s.ampHold > 0) s.ampHold--;
+  let delta = Math.floor((carRoomW(i, Infinity) - EXPORT_MARGIN_W) / i.site.wPerAmp);
+  if (delta > 0) {
+    delta = i.house.gridImportW < RECOVER_IMPORT_W && s.ampHold === 0 ? Math.min(delta, AMP_STEP) : 0;
+  } else if (delta < 0) {
+    s.ampHold = DERATE_HOLD_TICKS;
+  }
+  const target = clampAmps(i.site, s.lastAmps + delta);
+  if (target !== s.lastAmps) {
+    a.push({ kind: "set_amps", amps: target });
+    s.lastAmps = target;
+  }
+}
+
+/**
+ * GLIDE (battery at the house reserve; was SOLAR_TRACK until 2026-10-05):
+ * the car follows the PV surplus plus a glide allowance that spreads the
+ * energy above the DECAYING reserve evenly until the free window. Below the
+ * reserve nothing runs on the battery (reserve_hit). While stopped, restarts
+ * on sustained sun or once the bank can carry the car's minimum — for
+ * BANK_RUN_MINS (glide_mode asap) or all the way to the window (continuous).
+ */
+function morningGlide(
+  i: DecideInputs,
+  s: StoredState,
+  a: Action[],
+  h: {
+    charging: boolean;
+    stop: (reason: string) => void;
+    start: (amps: number) => void;
+    canStart: () => boolean;
+    learnFloor: () => void;
+  },
+): void {
+  const varsOk = i.house.pvW !== null && i.house.feedinW !== null;
+  // Glide (2026-09-29): spread the battery's energy above the reserve
+  // evenly until 11:00, on top of the PV, instead of leaving it idle for
+  // the free refill. One tick of buffer so the last tick doesn't overshoot.
+  const minsLeft = i.site.windowStartMins - i.nowMins;
+  const bankWh = (i.house.socPct - s.reservePct) * i.site.batteryKwh * 10;
+  const spendW = Math.max(0, bankWh) / ((minsLeft + GLIDE_BUFFER_MINS) / 60);
+  // The battery may cover up to spendW, net of what it is ALREADY discharging
+  // (energy balance, as SOLAR_SOAK) — the meter can't see that drain, so
+  // without subtracting it the allowance would ratchet the amps up every tick.
+  const allowanceW = spendW - batteryDischargeW(i.house);
+
+  if (!varsOk) {
+    // degrade to floor-hold: stop, wait for the free window (SPEC fallback)
+    if (!s.solarVarsAlerted) {
+      a.push({ kind: "notify", message: "pvPower/feedinPower missing — solar tracking disabled, floor-hold" });
+      s.solarVarsAlerted = true;
+    }
+    if (h.charging && s.sessionOwner === "system") h.stop("solar_vars_missing");
+    return;
+  }
+
+  if (h.charging) {
+    if (s.sessionOwner !== "system") return;
+    if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
+    if (i.house.socPct <= s.reservePct && i.house.loadW - i.house.pvW! > RESERVE_BLEED_W) {
+      // Self-Use keeps the meter at ~0 while the battery covers the car, so
+      // the amp loop below is blind to battery drain until the hardware
+      // floor. At/below reserve anything PV doesn't cover comes from the
+      // battery or paid grid — stop now (2026-07-08: the 1 A/tick ramp
+      // bled the battery from reserve to the 10% floor, then imported).
+      h.stop("reserve_hit");
+      return;
+    }
+    // failsafe: if amp commands are failing and import persists, stop
+    if (i.house.gridImportW > SUSTAINED_IMPORT_W) {
+      if (++s.highImportTicks >= SUSTAINED_IMPORT_TICKS) {
+        h.stop("sustained_import");
+        h.learnFloor();
+        a.push({ kind: "notify", message: "GLIDE: sustained grid import — stopped charge" });
+        s.highImportTicks = 0;
+        return;
+      }
+    } else {
+      s.highImportTicks = 0;
+    }
+    // Closed loop on the meter; floor() + margin bias errors toward export.
+    const delta = Math.floor((carRoomW(i, allowanceW) - EXPORT_MARGIN_W) / i.site.wPerAmp);
+    const target = clampAmps(i.site, s.lastAmps + delta);
+    if (target === i.site.minAmps && s.lastAmps === i.site.minAmps && i.house.gridImportW > STOP_IMPORT_W) {
+      h.stop("below_solar_min"); // surplus can't sustain the car's minimum draw
+      h.learnFloor();
+    } else if (target !== s.lastAmps) {
+      a.push({ kind: "set_amps", amps: target });
+      s.lastAmps = target;
+    }
+    return;
+  }
+
+  // Stopped. Resume throttle: 15 min of sustained surplus, capped per day (wear).
+  const surplus = i.cfg.solarTrack ? i.house.pvW! - i.house.loadW : 0;
+  s.surplusStreak = surplus >= i.site.minAmps * i.site.wPerAmp + RESUME_HEADROOM_W ? s.surplusStreak + 1 : 0;
+  // Solar bank: PV the battery absorbed above reserve (loadsPower is
+  // house-only while the car is off). Resume once that bank plus today's
+  // surplus carries the car's minimum for the run length the mode wants:
+  //   asap        — BANK_RUN_MINS (or to the window if that is sooner): less
+  //                 morning PV is stranded if the owner drives off early,
+  //                 at the cost of a stop/restart cycle every time the
+  //                 decaying reserve frees another few percent.
+  //   continuous  — all the way to the window: one contactor cycle, and the
+  //                 car carries straight on into FREE_WINDOW.
+  // Either way the run ends at reserve via reserve_hit (battery above
+  // reserve covers any shortfall, so no import).
+  const runMins = i.cfg.glideMode === "continuous" ? minsLeft : Math.min(BANK_RUN_MINS, minsLeft);
+  const needWh = (Math.max(0, i.site.minAmps * i.site.wPerAmp - surplus) * runMins) / 60;
+  const banked = i.cfg.solarTrack && bankWh > 0 && bankWh >= needWh;
+  if ((s.surplusStreak >= RESUME_STREAK_TICKS || banked) && s.solarResumes < MAX_SOLAR_RESUMES && h.canStart()) {
+    s.surplusStreak = 0;
+    s.solarResumes++;
+    h.start(startAmps(i, allowanceW));
+  }
+}
 
 /**
  * SOLAR_SOAK (after the free window, see SPEC): the battery is full and
@@ -489,6 +596,12 @@ const floorImportW = (site: Site) =>
  * the battery shows it next tick. The full battery is only a buffer:
  * SOAK_MIN_SOC is the hard stop, so the evening export and next morning's
  * dump are untouched.
+ * soak_export 'false' (2026-10-05): export is worth keeping, so the car may
+ * only eat PV the inverter is curtailing — observable as feed-in sitting at
+ * the EXPORT_LIMIT_W cap with a full battery. The export term is dropped,
+ * starts and probes need the cap reached, and feed-in falling below the cap
+ * while charging means the car is eating export: step down, stop at the
+ * minimum. Without the cap var curtailment is invisible, so no soak starts.
  */
 function soak(
   i: DecideInputs,
@@ -523,6 +636,11 @@ function soak(
   if (s.soakHold > 0) s.soakHold--;
   const spareW = i.house.pvW - i.house.loadW; // PV beyond house + car
   const batteryW = i.house.feedinW - i.house.gridImportW - spareW;
+  // Curtailed-only mode: the export cap we must leave untouched (null = the
+  // cap is unknown, so curtailment can't be seen and nothing starts).
+  const capW = i.cfg.soakExport ? null : i.site.exportLimitW;
+  const atCap = capW === null ? i.cfg.soakExport : i.house.feedinW >= capW - EXPORT_MARGIN_W;
+  const exportLostW = capW === null ? 0 : Math.max(0, capW - EXPORT_MARGIN_W - i.house.feedinW);
 
   if (own) {
     if (s.lastAmps === null) s.lastAmps = i.car.chargeAmps;
@@ -531,23 +649,30 @@ function soak(
       s.soakHold = SOAK_RESTART_HOLD_TICKS;
       s.soakLowTicks = 0;
     };
-    if (i.house.socPct < SOAK_MIN_SOC) {
-      stopSoak("soak_battery_low");
-    } else if (batteryW > SOAK_DISCHARGE_W) {
-      if (s.lastAmps <= i.site.minAmps) {
-        if (++s.soakLowTicks >= SOAK_LOW_TICKS) stopSoak("soak_below_min");
+    const shed = (w: number, reason: string) => {
+      if (s.lastAmps! <= i.site.minAmps) {
+        if (++s.soakLowTicks >= SOAK_LOW_TICKS) stopSoak(reason);
       } else {
         s.soakLowTicks = 0;
-        const target = clampAmps(i.site, s.lastAmps - Math.ceil(batteryW / i.site.wPerAmp));
+        const target = clampAmps(i.site, s.lastAmps! - Math.ceil(w / i.site.wPerAmp));
         a.push({ kind: "set_amps", amps: target });
         s.lastAmps = target;
         s.soakHold = SOAK_STEP_HOLD_TICKS;
       }
+    };
+    if (i.house.socPct < SOAK_MIN_SOC) {
+      stopSoak("soak_battery_low");
+    } else if (batteryW > SOAK_DISCHARGE_W) {
+      shed(batteryW, "soak_below_min");
+    } else if (exportLostW > 0) {
+      shed(exportLostW, "soak_export_lost"); // the car is eating export we want to keep
     } else {
       s.soakLowTicks = 0;
-      const visibleW = Math.max(i.house.feedinW - i.house.gridImportW, spareW);
+      // Visible surplus: export or PV into the battery (default), or only
+      // the PV the battery is absorbing (curtailed-only: spare minus export).
+      const visibleW = capW === null ? Math.max(i.house.feedinW - i.house.gridImportW, spareW) : -batteryW;
       let target = s.lastAmps + Math.max(0, Math.floor((visibleW - EXPORT_MARGIN_W) / i.site.wPerAmp));
-      if (target === s.lastAmps && s.soakHold === 0 && i.house.socPct >= SOAK_START_SOC) target++; // probe
+      if (target === s.lastAmps && s.soakHold === 0 && i.house.socPct >= SOAK_START_SOC && atCap) target++; // probe
       target = clampAmps(i.site, target);
       if (target !== s.lastAmps) {
         a.push({ kind: "set_amps", amps: target });
@@ -557,6 +682,7 @@ function soak(
   } else if (
     !h.charging &&
     i.house.socPct >= SOAK_START_SOC &&
+    atCap &&
     i.nowMins < i.site.soakEndMins - SOAK_LAST_START_LEAD_MINS &&
     s.soakHold === 0 &&
     s.soakStarts < SOAK_MAX_STARTS &&

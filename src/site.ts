@@ -33,6 +33,16 @@ export interface Site {
   maxAmps: number;
   /** Geofence radius around config home_lat/home_lon (invariant 7). */
   homeRadiusM: number;
+  /** Most AC power the inverter can deliver to the house from the battery
+   *  (plus PV), W. Sizes the morning dump: the car starts at what fits under
+   *  it after house load, so a small inverter never opens at max amps and
+   *  imports until the derate loop catches up. The grid meter stays the
+   *  ground truth; this only sets the starting point and the ceiling. */
+  inverterMaxW: number;
+  /** Grid export limit, W (0 = zero-export site); null = unknown / none.
+   *  Only read when D1 config soak_export is 'false': PV counts as curtailed
+   *  (free to put in the car) while feed-in sits at this cap. */
+  exportLimitW: number | null;
 }
 
 export interface SiteVars {
@@ -48,6 +58,8 @@ export interface SiteVars {
   CHARGER_MIN_AMPS?: unknown;
   CHARGER_MAX_AMPS?: unknown;
   HOME_RADIUS_M?: unknown;
+  INVERTER_MAX_W?: unknown; // 15000
+  EXPORT_LIMIT_W?: unknown; // optional: 5000, or 0 for a zero-export site
 }
 
 export function siteFromEnv(env: SiteVars): Site {
@@ -97,6 +109,8 @@ export function siteFromEnv(env: SiteVars): Site {
     minAmps: num("CHARGER_MIN_AMPS"),
     maxAmps: num("CHARGER_MAX_AMPS"),
     homeRadiusM: num("HOME_RADIUS_M"),
+    inverterMaxW: num("INVERTER_MAX_W"),
+    exportLimitW: optionalNonNegative(env, "EXPORT_LIMIT_W"),
   };
   if (missing.length) throw new Error(`missing site vars in wrangler.jsonc: ${missing.join(", ")}`);
 
@@ -114,6 +128,15 @@ export function siteFromEnv(env: SiteVars): Site {
     throw new Error("CHARGER_MIN_AMPS / CHARGER_MAX_AMPS must be integers with min <= max");
   }
   return site;
+}
+
+/** An optional var: unset/blank = null; otherwise a number >= 0. */
+function optionalNonNegative(env: SiteVars, k: keyof SiteVars): number | null {
+  const v = env[k];
+  if (v === undefined || v === null || String(v).trim() === "") return null;
+  const n = Number(String(v).trim());
+  if (!Number.isFinite(n) || n < 0) throw new Error(`var ${k}="${String(v)}" must be a number >= 0 (or unset)`);
+  return n;
 }
 
 const formatters = new Map<string, Intl.DateTimeFormat>();
