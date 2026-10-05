@@ -23,8 +23,12 @@ You need:
   from foxesscloud.com → User Profile → API Management). The inverter should
   run Self-Use outside the free window and ForceCharge during it. You set that
   schedule yourself in the FoxESS app.
-- **A Tesla on a [Tessie](https://tessie.com) account.** Tessie signs the
-  commands and serves cached state without waking the car.
+- **A Tesla on a [Tessie](https://tessie.com) or
+  [Teslascope](https://teslascope.com) account.** Either one signs the
+  commands and serves cached state without waking the car. Teslascope
+  support is newer: run in shadow mode and check `GET /debug/car` and your
+  first `/backfill` before trusting it (see SPEC.md "Teslascope
+  integration").
 - **A daily free or cheap grid window** at the same local (wall-clock) time
   each day. Daylight saving is handled: set `TIME_ZONE` to your IANA zone and
   the window follows the clock change.
@@ -33,7 +37,7 @@ You need:
 
 ## How it works
 
-A cron runs every 5 minutes. Each tick reads the car (Tessie) and the
+A cron runs every 5 minutes. Each tick reads the car (Tessie or Teslascope) and the
 inverter (FoxESS Open API) and runs a pure state machine (`src/tick.ts`). It
 then sends the resulting car commands: start, stop and set amps. The
 inverter is never written to. The FoxESS `minSocOnGrid` floor and the car's
@@ -66,7 +70,11 @@ There are three layers:
    | `solar_soak`       | on       | Afternoon solar soak after the window (`'false'` to disable).   |
 
 3. **Secrets** (`wrangler secret put …`, with local copies in `.dev.vars`):
-   `TESSIE_TOKEN`, `TESSIE_VIN`, `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`,
+   `TESSIE_TOKEN` + `TESSIE_VIN` **or** `TESLASCOPE_TOKEN` +
+   `TESLASCOPE_VEHICLE_ID` (exactly one car provider; the Teslascope token
+   is a personal access token from Developers → Applications, and the
+   vehicle ID is the public ID in your vehicle's Teslascope URL),
+   `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`,
    `NTFY_TOPIC`, and `ADMIN_KEY` (the bearer token for the admin HTTP
    routes). Pick an unguessable ntfy topic, because anyone who knows it can
    read your alerts.
@@ -90,7 +98,7 @@ pnpm exec wrangler d1 create ev_optimiser   # put the printed id in wrangler.jso
 # edit the "vars" block in wrangler.jsonc for your site
 pnpm run migrate -- --remote                # pnpm run migrate alone targets the local dev DB
 cp .dev.vars.example .dev.vars              # fill in local secrets
-pnpm exec wrangler secret put TESSIE_TOKEN  # repeat for every secret
+pnpm exec wrangler secret put TESSIE_TOKEN  # repeat for every secret (or TESLASCOPE_*)
 pnpm exec wrangler d1 execute ev_optimiser --remote \
   --command "INSERT INTO config (key, value) VALUES ('home_lat','<lat>'), ('home_lon','<lon>')"
 pnpm test

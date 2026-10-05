@@ -1,6 +1,6 @@
 # EV + Home Battery Charge Optimiser
 
-Cloudflare Worker that optimises charging of a Tesla (via Tessie) from a
+Cloudflare Worker that optimises charging of a Tesla (via Tessie or Teslascope) from a
 FoxESS home battery, exploiting a daily free grid-power window (11:00–14:00
 on the reference install; configurable).
 
@@ -12,7 +12,7 @@ is the operational summary.
 
 The EV charger is just a big house load: when the FoxESS is in Self-Use mode,
 starting the car at 11 kW makes the inverter discharge the home battery to
-cover it. So the controller manipulates the CAR (start/stop/amps via Tessie)
+cover it. So the controller manipulates the CAR (start/stop/amps via the car API)
 and relies on one static, owner-set FoxESS floor (`minSocOnGrid`, read-only,
 once at PLAN) as the hardware backstop. The house's forecast energy until
 11:00 is reserved ON TOP of that floor (the BATTERY_MIN_SOC BMS minimum unless the owner
@@ -73,9 +73,14 @@ src/testing.ts):
   the nightly load pull. SHADOW MODE until config shadow_mode='false' — see
   SPEC step 5
 - State: D1 (SQLite) — see migrations/0001_init.sql
-- Car: Tessie API (https://api.tessie.com, bearer token) — handles command
-  signing and retries; state reads are served from Tessie's cache and do not
-  wake the car
+- Car: one provider behind src/clients/car.ts (`CarClient`), chosen by
+  which token secret is set (both or neither = config error):
+  - Tessie API (https://api.tessie.com, bearer token) — handles command
+    signing and retries; state reads are served from Tessie's cache and do
+    not wake the car
+  - Teslascope API (https://teslascope.com/api, personal-access-token
+    bearer, per-vehicle public ID) — amps command name and charging-history
+    shape are NOT yet live-verified; see src/clients/teslascope.ts
 - Inverter: FoxESS Open API (https://www.foxesscloud.com/public/i18n/en/OpenApiDocument.html)
   — API-key auth with an MD5 request signature; rate limit 1,440 calls/day
 - Alerts: ntfy.sh topic (push to phone)
@@ -96,7 +101,8 @@ The repo is pnpm-managed (since 2026-07-04) — use `pnpm add`, never
 
 ## Secrets (wrangler secret put …)
 
-- `TESSIE_TOKEN`, `TESSIE_VIN`
+- `TESSIE_TOKEN`, `TESSIE_VIN` — or `TESLASCOPE_TOKEN`,
+  `TESLASCOPE_VEHICLE_ID` (exactly one provider)
 - `FOXESS_API_KEY`, `FOXESS_DEVICE_SN`
 - `NTFY_TOPIC` (optional var `NTFY_URL` for a self-hosted ntfy server)
 - `ADMIN_KEY` — bearer for admin HTTP routes (/backfill, step-3 endpoints);

@@ -406,6 +406,35 @@ default (trades overnight house autonomy for car charge).
   battery_level, charge_limit_soc, charging_state, charge_port_latch and
   charge_amps without waking the car.
 
+## Teslascope integration (alternative car provider, added 2026-10-05)
+
+- Selected instead of Tessie by setting TESLASCOPE_TOKEN +
+  TESLASCOPE_VEHICLE_ID (src/clients/car.ts `carFromEnv`). Both providers'
+  tokens set, or neither, is a config error: the Worker idles and alerts
+  hourly, it never picks one.
+- Base https://teslascope.com/api, `Authorization: Bearer <personal access
+  token>`. Per-vehicle paths use the Teslascope public ID, not the VIN.
+- Reads: GET /vehicle/{id}/detailed — Teslascope's last-polled state
+  (does not wake the car); Fleet-API-shaped charge_state / drive_state, so
+  the same fields as Tessie. charging_state is preferred; if absent,
+  detailed_charge_state ("DetailedChargeStateCharging") is mapped by
+  stripping the prefix. An optional { response: … } envelope is unwrapped.
+- Commands: POST /vehicle/{id}/command/startCharging | stopCharging
+  (verified via the openHAB Teslascope binding) | setChargingAmps
+  (UNVERIFIED name; sends both `amps` and `charging_amps` query params).
+  A non-2xx throws, so a rejected amps command fails the tick loudly.
+- Charge history: GET /vehicle/{id}/charging-history, filtered to the
+  requested range client-side. Shape UNVERIFIED: the client accepts the
+  plausible spellings (started_at/start_date/…; unix s/ms or a zoned ISO
+  string) and fails loud otherwise; zoneless date strings are rejected
+  (Workers would read them as UTC). RISK: Teslascope documents this as
+  "supercharging (and related)" history. If it omits home AC sessions,
+  home charges are NOT excluded from load_samples and inflate the
+  forecast (a too-high reserve: suboptimal, never unsafe). After the first
+  /backfill, run the residual-spike SQL check under "Backfill" above.
+- GET /debug/car (ADMIN_KEY) returns the provider name and the raw state
+  payload, for checking these shapes before leaving shadow mode.
+
 ## Reference install (confirmed 2026-07-04)
 
 The facts the reference install's tuning was derived from. Yours will
