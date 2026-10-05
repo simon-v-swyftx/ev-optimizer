@@ -22,6 +22,9 @@ export interface Site {
   soakEndMins: number;
   /** Home battery usable capacity. */
   batteryKwh: number;
+  /** Battery's own minimum SoC (BMS floor), %. The reserve never sits below
+   *  it, and it is assumed when the FoxESS minSocOnGrid read fails. */
+  batteryMinSocPct: number;
   /** Charger watts per amp step (volts x phases, e.g. 230 V x 3 = 690). */
   wPerAmp: number;
   minAmps: number;
@@ -37,6 +40,7 @@ export interface SiteVars {
   DAY_START?: unknown; // "05:30"
   SOLAR_SOAK_END?: unknown; // "17:30"
   BATTERY_KWH?: unknown;
+  BATTERY_MIN_SOC?: unknown; // %
   CHARGER_VOLTS?: unknown;
   CHARGER_PHASES?: unknown;
   CHARGER_MIN_AMPS?: unknown;
@@ -83,6 +87,7 @@ export function siteFromEnv(env: SiteVars): Site {
     dayStartMins: hhmm("DAY_START"),
     soakEndMins: hhmm("SOLAR_SOAK_END"),
     batteryKwh: num("BATTERY_KWH"),
+    batteryMinSocPct: num("BATTERY_MIN_SOC"),
     wPerAmp: num("CHARGER_VOLTS") * num("CHARGER_PHASES"),
     minAmps: num("CHARGER_MIN_AMPS"),
     maxAmps: num("CHARGER_MAX_AMPS"),
@@ -96,6 +101,9 @@ export function siteFromEnv(env: SiteVars): Site {
   }
   if (site.soakEndMins < site.windowEndMins || site.soakEndMins > 23 * 60 + 30) {
     throw new Error("SOLAR_SOAK_END must be between FREE_WINDOW_END and 23:30");
+  }
+  if (!Number.isInteger(site.batteryMinSocPct) || site.batteryMinSocPct >= 100) {
+    throw new Error("BATTERY_MIN_SOC must be a whole percentage below 100");
   }
   if (!Number.isInteger(site.minAmps) || !Number.isInteger(site.maxAmps) || site.minAmps > site.maxAmps) {
     throw new Error("CHARGER_MIN_AMPS / CHARGER_MAX_AMPS must be integers with min <= max");

@@ -21,7 +21,7 @@ export class TessieClient {
     chargingState: string;
     socPct: number;
     limitPct: number;
-    chargeAmps: number;
+    chargeAmps: number | null;
     latLon: { lat: number; lon: number } | null;
   }> {
     const raw = (await this.req("GET", `/${this.vin}/state`)) as {
@@ -46,7 +46,7 @@ export class TessieClient {
       chargingState,
       socPct,
       limitPct,
-      chargeAmps: num("charge_amps") ?? 16,
+      chargeAmps: num("charge_amps"), // null = not reported
       latLon,
     };
   }

@@ -47,7 +47,7 @@ There are three layers:
 
 1. **Site vars in `wrangler.jsonc`** (needs a redeploy). These describe your
    install: `UTC_OFFSET`, `FREE_WINDOW_START`/`FREE_WINDOW_END`, `DAY_START`,
-   `SOLAR_SOAK_END`, `BATTERY_KWH`, `CHARGER_VOLTS`, `CHARGER_PHASES`,
+   `SOLAR_SOAK_END`, `BATTERY_KWH`, `BATTERY_MIN_SOC`, `CHARGER_VOLTS`, `CHARGER_PHASES`,
    `CHARGER_MIN_AMPS`, `CHARGER_MAX_AMPS`, `HOME_RADIUS_M`, and optionally
    `NTFY_URL` for a self-hosted ntfy server. Each one is commented in the
    file. **All of them are required.** If one is missing or malformed, the

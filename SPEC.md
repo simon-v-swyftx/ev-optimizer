@@ -4,9 +4,12 @@ Numbers and clock times in this document describe the **reference install**
 the design was developed on (see "Reference install"). On your install they
 come from the site vars in `wrangler.jsonc` (`UTC_OFFSET`,
 `FREE_WINDOW_START`/`END`, `DAY_START`, `SOLAR_SOAK_END`, `BATTERY_KWH`,
-charger volts/phases/amps, `HOME_RADIUS_M`) — read "11:00" as "free-window
-start", "14:00" as "free-window end", "05:30" as `DAY_START`, "42 kWh" as
-`BATTERY_KWH`, "16 A" as `CHARGER_MAX_AMPS`, and so on. "The owner" is
+`BATTERY_MIN_SOC`, charger volts/phases/amps, `HOME_RADIUS_M`) — read
+"11:00" as "free-window start", "14:00" as "free-window end", "05:30" as
+`DAY_START`, "42 kWh" as `BATTERY_KWH`, "10% BMS minimum" as
+`BATTERY_MIN_SOC`, "16 A" as `CHARGER_MAX_AMPS`, and so on. The 8 kW
+floor-hit import trigger and 4.5 kW solar-resume surplus scale with the
+charger (72.5% of max draw; minimum draw + 1.05 kW). "The owner" is
 whoever runs the install. Dated notes are the design's decision log.
 
 ## Problem

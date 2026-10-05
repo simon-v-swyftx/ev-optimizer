@@ -236,7 +236,7 @@ export async function runTick(
       chargingState: car.chargingState,
       socPct: car.socPct,
       limitPct: car.limitPct,
-      chargeAmps: car.chargeAmps,
+      chargeAmps: car.chargeAmps ?? site.maxAmps,
       atHome,
     },
     house,
@@ -298,7 +298,7 @@ export async function runTick(
   if (!stored && floorReadErr !== undefined) {
     const msg = floorReadErr instanceof Error ? floorReadErr.message : String(floorReadErr);
     if (!shadowMode) {
-      await notify(env, `reserve floor read failed (assuming 10%): ${msg}`);
+      await notify(env, `reserve floor read failed (assuming ${site.batteryMinSocPct}%): ${msg}`);
     } else {
       console.error("floor read failed (shadow)", floorReadErr);
     }

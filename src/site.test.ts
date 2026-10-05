@@ -11,6 +11,7 @@ const vars: SiteVars = {
   DAY_START: "05:30",
   SOLAR_SOAK_END: "17:30",
   BATTERY_KWH: "42",
+  BATTERY_MIN_SOC: "10",
   CHARGER_VOLTS: "230",
   CHARGER_PHASES: "3",
   CHARGER_MIN_AMPS: "5",
@@ -33,6 +34,7 @@ describe("siteFromEnv", () => {
       dayStartMins: 330,
       soakEndMins: 1050,
       batteryKwh: 42,
+      batteryMinSocPct: 10,
       wPerAmp: 690,
       minAmps: 5,
       maxAmps: 16,
@@ -96,5 +98,40 @@ describe("decide honours the site", () => {
     // 06:00 -> 4 bootstrap slots x 0.5 kWh x 1.3 / 42 = 6.2% -> 7 + 10
     expect(decide(inputs(360, early)).next.reservePct).toBe(17);
     expect(decide(inputs(360)).next.reservePct).toBe(26);
+  });
+
+  it("uses BATTERY_MIN_SOC as the floor when the minSocOnGrid read fails", () => {
+    const site = siteFromEnv({ ...vars, BATTERY_MIN_SOC: "20" });
+    const i = { ...inputs(360, site), floorPct: null };
+    expect(decide(i).next.floorPct).toBe(20);
+    expect(decide(i).next.reservePct).toBe(36); // 16% house need on top of 20
+  });
+
+  it("scales the floor-hit import trigger with the charger (7.4 kW single-phase)", () => {
+    const site = siteFromEnv({ ...vars, CHARGER_PHASES: "1", CHARGER_MIN_AMPS: "6", CHARGER_MAX_AMPS: "32" });
+    const dumping = (gridImportW: number) => {
+      const i = inputs(400, site);
+      i.car.chargingState = "Charging";
+      i.house = { ...i.house, socPct: 60, loadW: 7800, gridImportW };
+      i.stored = { ...decide(inputs(395, site)).next, state: "DUMPING", sessionOwner: "system", lastAmps: 32 };
+      return decide(i).next.state;
+    };
+    // 32 A x 230 V = 7.36 kW; trigger = 72.5% rounded to 100 W = 5.3 kW. A
+    // fixed 8 kW (the 11 kW reference) would never fire on this charger.
+    expect(dumping(5400)).toBe("SOLAR_TRACK");
+    expect(dumping(5200)).toBe("DUMPING");
+  });
+
+  it("resumes on surplus sized to the car's minimum draw", () => {
+    const site = siteFromEnv({ ...vars, CHARGER_PHASES: "1", CHARGER_MIN_AMPS: "6", CHARGER_MAX_AMPS: "32" });
+    // 6 A x 230 V = 1.38 kW minimum + 1.05 kW headroom = 2.43 kW surplus
+    const streak = (pvW: number) => {
+      const i = inputs(420, site);
+      i.house = { ...i.house, socPct: 15, loadW: 400, pvW };
+      i.stored = { ...decide(inputs(415, site)).next, state: "SOLAR_TRACK" };
+      return decide(i).next.surplusStreak;
+    };
+    expect(streak(400 + 2430)).toBe(1);
+    expect(streak(400 + 2420)).toBe(0);
   });
 });

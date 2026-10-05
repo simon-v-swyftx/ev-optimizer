@@ -36,6 +36,9 @@
     "SOLAR_SOAK_END": "17:30",
     // Home battery usable capacity.
     "BATTERY_KWH": 42,
+    // Battery's own minimum SoC (BMS floor), %. The house reserve never sits
+    // below it; assumed when the FoxESS minSocOnGrid read fails.
+    "BATTERY_MIN_SOC": 10,
     // Charger: watts per amp = volts x phases (230 V three-phase = 690 W/A).
     "CHARGER_VOLTS": 230,
     "CHARGER_PHASES": 3,

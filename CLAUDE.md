@@ -15,7 +15,7 @@ starting the car at 11 kW makes the inverter discharge the home battery to
 cover it. So the controller manipulates the CAR (start/stop/amps via Tessie)
 and relies on one static, owner-set FoxESS floor (`minSocOnGrid`, read-only,
 once at PLAN) as the hardware backstop. The house's forecast energy until
-11:00 is reserved ON TOP of that floor (10% BMS minimum unless the owner
+11:00 is reserved ON TOP of that floor (the BATTERY_MIN_SOC BMS minimum unless the owner
 raised it), so the house never runs on grid because the battery hit its
 minimum. That reserve decays through the morning as the house uses its
 need, and anything above it glides into the car by 11:00.
@@ -25,8 +25,10 @@ need, and anything above it glides into the car by 11:00.
 Per-install facts are Worker `vars` in wrangler.jsonc, parsed and validated
 by src/site.ts and passed into the pure state machine as `DecideInputs.site`.
 Never hard-code them in logic: UTC_OFFSET, FREE_WINDOW_START/END, DAY_START,
-SOLAR_SOAK_END, BATTERY_KWH, CHARGER_VOLTS/PHASES/MIN_AMPS/MAX_AMPS,
-HOME_RADIUS_M. All are required — a missing var stops the controller with
+SOLAR_SOAK_END, BATTERY_KWH, BATTERY_MIN_SOC,
+CHARGER_VOLTS/PHASES/MIN_AMPS/MAX_AMPS, HOME_RADIUS_M. Thresholds that scale
+with the hardware (floor-hit import, solar resume surplus) are derived from
+them in src/tick.ts; src/constants.ts holds only hardware-agnostic tuning. All are required — a missing var stops the controller with
 an alert rather than defaulting to another site's values.
 
 The reference install (the numbers in SPEC.md and the test suite,
@@ -43,7 +45,7 @@ src/testing.ts):
 ## Non-negotiable safety invariants
 
 1. The house reserve sits on top of FoxESS `minSocOnGrid` (never below the
-   10% BMS minimum); the controller never writes inverter settings. If the
+   BATTERY_MIN_SOC BMS minimum); the controller never writes inverter settings. If the
    grid is offline, stop the system's charge immediately and start nothing
    until it's back — the house battery is for the house.
 2. Every failure mode must degrade to "slightly suboptimal", never "flat house

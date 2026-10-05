@@ -4,14 +4,14 @@ import {
   BANK_RUN_MINS,
   DERATE_IMPORT_W,
   EXPORT_MARGIN_W,
-  FLOOR_IMPORT_W,
+  FLOOR_IMPORT_FRACTION,
   GLIDE_BUFFER_MINS,
   MAX_SOLAR_RESUMES,
   OFF_GRID_RUNNING_STATE,
   RECOVER_IMPORT_W,
   RESERVE_BLEED_W,
   RESUME_STREAK_TICKS,
-  RESUME_SURPLUS_W,
+  RESUME_HEADROOM_W,
   SOAK_DISCHARGE_W,
   SOAK_LOW_TICKS,
   SOAK_MAX_STARTS,
@@ -74,17 +74,16 @@ export interface StoredState {
 
 /** Fields added after go-live; a state row persisted by an older build lacks
  *  them, so they are defaulted when the row is loaded mid-day. */
-const LATE_FIELDS: Pick<
-  StoredState,
-  "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown" | "floorPct" | "slotKwh"
-> = {
-  floorPct: 10,
+const lateFields = (
+  site: Site,
+): Pick<StoredState, "soakStarts" | "soakHold" | "soakLowTicks" | "gridDown" | "floorPct" | "slotKwh"> => ({
+  floorPct: site.batteryMinSocPct,
   slotKwh: null,
   soakStarts: 0,
   soakHold: 0,
   soakLowTicks: 0,
   gridDown: null,
-};
+});
 
 export interface DecideInputs {
   date: string;
@@ -138,12 +137,12 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   // PLAN: first tick of a new day.
   const s: StoredState =
     i.stored && i.stored.date === i.date
-      ? { ...LATE_FIELDS, ...i.stored }
+      ? { ...lateFields(i.site), ...i.stored }
       : {
           date: i.date,
           state: "IDLE",
           // House energy until 11:00 on top of the hardware floor (see
-          // DecideInputs.floorPct). Floor unknown -> 10% BMS minimum; the
+          // DecideInputs.floorPct). Floor unknown -> the BMS minimum; the
           // learned-floor rule catches a higher one from import evidence.
           // reservePct is filled in by refreshReserve() below.
           reservePct: 0,
@@ -156,8 +155,8 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
           manualNoted: false,
           solarVarsAlerted: false,
           highImportTicks: 0,
-          ...LATE_FIELDS,
-          floorPct: Math.max(10, i.floorPct ?? 10),
+          ...lateFields(i.site),
+          floorPct: Math.max(i.site.batteryMinSocPct, i.floorPct ?? i.site.batteryMinSocPct),
           slotKwh: morningSlotKwh(i.samples, i.site.windowStartMins / 30),
         };
 
@@ -168,6 +167,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
       slotKwh: s.slotKwh,
       safetyFactor: i.cfg.safetyFactor,
       batteryKwh: i.site.batteryKwh,
+      minSocPct: i.site.batteryMinSocPct,
       floorPct: s.floorPct,
     });
   };
@@ -353,7 +353,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
   } else if (st === "IDLE") {
     st = i.house.socPct > s.reservePct ? "DUMPING" : "SOLAR_TRACK";
   } else if (st === "DUMPING") {
-    if (i.house.gridImportW > FLOOR_IMPORT_W) {
+    if (i.house.gridImportW > floorImportW(i.site)) {
       learnFloor(); // floor hit before a SoC read caught it: reserve_hit stops the car this tick
       st = "SOLAR_TRACK";
     } else if (i.house.socPct <= s.reservePct) {
@@ -446,7 +446,7 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
     } else if (!charging) {
       // resume throttle: 15 min of sustained surplus, capped per day (wear)
       const surplus = i.cfg.solarTrack && i.house.pvW !== null ? i.house.pvW - i.house.loadW : 0;
-      s.surplusStreak = surplus >= RESUME_SURPLUS_W ? s.surplusStreak + 1 : 0;
+      s.surplusStreak = surplus >= i.site.minAmps * i.site.wPerAmp + RESUME_HEADROOM_W ? s.surplusStreak + 1 : 0;
       // Solar bank: PV the battery absorbed above reserve (loadsPower is
       // house-only while the car is off). Resume as soon as that bank plus
       // today's surplus carries the car's minimum for BANK_RUN_MINS, rather
@@ -475,6 +475,8 @@ export function decide(i: DecideInputs): { actions: Action[]; next: StoredState 
 }
 
 const clampAmps = (site: Site, a: number) => Math.min(site.maxAmps, Math.max(site.minAmps, a));
+const floorImportW = (site: Site) =>
+  Math.round((site.maxAmps * site.wPerAmp * FLOOR_IMPORT_FRACTION) / 100) * 100;
 
 /**
  * SOLAR_SOAK (after the free window, see SPEC): the battery is full and

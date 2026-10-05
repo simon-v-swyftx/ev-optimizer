@@ -35,8 +35,13 @@ export const EXPORT_MARGIN_W = 250; // bias tracking error toward export, never 
 export const STOP_IMPORT_W = 250; // clamped at MIN_AMPS and still importing -> stop
 export const DERATE_IMPORT_W = 500; // DUMPING: battery limiting -> step down
 export const RECOVER_IMPORT_W = 100; // DUMPING: headroom back -> step up
-export const FLOOR_IMPORT_W = 8000; // floor hit before a SoC read caught it
-export const RESUME_SURPLUS_W = 4500; // pv - house load needed to resume
+/** DUMPING: grid import above this fraction of the charger's max draw means
+ *  the battery hit its floor before a SoC read caught it (rounded to 100 W;
+ *  8 kW for an 11 kW charger). */
+export const FLOOR_IMPORT_FRACTION = 0.725;
+/** pv - house load needed to resume: the car's minimum draw plus this
+ *  (3.45 kW + 1.05 kW = 4.5 kW for a three-phase 5 A minimum). */
+export const RESUME_HEADROOM_W = 1050;
 export const RESUME_STREAK_TICKS = 3; // 15 min of sustained sun before a restart
 export const MAX_SOLAR_RESUMES = 4; // contactor-wear cap per day
 export const RESERVE_BLEED_W = 250; // at/below reserve: load beyond pv+this = battery/grid feeding the car

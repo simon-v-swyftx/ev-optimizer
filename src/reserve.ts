@@ -2,10 +2,10 @@
  * House reserve calculation. See SPEC.md "PLAN".
  *
  * reserve_kwh = forecast house load from `nowSlot` until the free window x safetyFactor
- * reserve_pct = ceil(reserve_kwh / batteryKwh * 100) + floor, clamped 10..100
+ * reserve_pct = ceil(reserve_kwh / batteryKwh * 100) + floor, clamped minSocPct..100
  *
- * `floor` is the FoxESS minSocOnGrid (10% BMS minimum unless the owner raised
- * it). The house's energy sits ON TOP of it: the inverter won't discharge
+ * `floor` is the FoxESS minSocOnGrid (the battery's BMS minimum, minSocPct,
+ * unless the owner raised it). The house's energy sits ON TOP of it: the inverter won't discharge
  * below the floor, so a reserve AT the floor would leave the house on paid
  * grid until the free window (owner, 2026-09-27: never pull from grid because the
  * battery hit its minimum).
@@ -24,10 +24,11 @@ export function reservePct(opts: {
   samples: { slot: number; loadKwh: number }[];
   safetyFactor: number;
   batteryKwh: number;
-  floorPct?: number; // FoxESS minSocOnGrid; default / below-minimum -> 10
+  minSocPct: number; // battery BMS minimum
+  floorPct?: number; // FoxESS minSocOnGrid; default / below-minimum -> minSocPct
 }): number {
-  const { nowSlot, windowStartSlot, samples, safetyFactor, batteryKwh } = opts;
-  const floor = Math.max(10, opts.floorPct ?? 10);
+  const { nowSlot, windowStartSlot, samples, safetyFactor, batteryKwh, minSocPct } = opts;
+  const floor = Math.max(minSocPct, opts.floorPct ?? minSocPct);
 
   const bySlot = new Map<number, { sum: number; n: number }>();
   for (const s of samples) {
@@ -39,7 +40,7 @@ export function reservePct(opts: {
 
   // Slots from nowSlot up to (not including) the window start, wrapping past
   // midnight so an evening dump's horizon of "until the window tomorrow" also
-  // works. At exactly the window start the horizon is empty and the reserve is the 10% floor.
+  // works. At exactly the window start the horizon is empty and the reserve is the floor.
   const nSlots = (windowStartSlot - nowSlot + 48) % 48;
   let forecastKwh = 0;
   for (let i = 0; i < nSlots; i++) {
@@ -48,7 +49,7 @@ export function reservePct(opts: {
   }
 
   const pct = Math.ceil(((forecastKwh * safetyFactor) / batteryKwh) * 100) + floor;
-  return Math.min(100, Math.max(10, pct));
+  return Math.min(100, Math.max(minSocPct, pct));
 }
 
 /** Forecast house kWh for each half-hour slot 0..windowStartSlot-1 (same
@@ -80,15 +81,16 @@ export function reserveAt(opts: {
   slotKwh: number[]; // from morningSlotKwh
   safetyFactor: number;
   batteryKwh: number;
+  minSocPct: number;
   floorPct: number;
 }): number {
-  const { nowMins, slotKwh, safetyFactor, batteryKwh } = opts;
-  const floor = Math.max(10, opts.floorPct);
+  const { nowMins, slotKwh, safetyFactor, batteryKwh, minSocPct } = opts;
+  const floor = Math.max(minSocPct, opts.floorPct);
   const slot = Math.floor(nowMins / 30);
   let kwh = 0;
   for (let k = slot; k < slotKwh.length; k++) {
     kwh += (slotKwh[k] ?? BOOTSTRAP_SLOT_KWH) * (k === slot ? (30 - (nowMins % 30)) / 30 : 1);
   }
   const pct = Math.ceil(((kwh * safetyFactor) / batteryKwh) * 100) + floor;
-  return Math.min(100, Math.max(10, pct));
+  return Math.min(100, Math.max(minSocPct, pct));
 }
