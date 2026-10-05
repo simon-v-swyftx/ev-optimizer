@@ -9,8 +9,10 @@
  */
 
 export interface Site {
-  /** Local-time offset from UTC in minutes. FIXED: no DST (invariant 5). */
-  tzOffsetMins: number;
+  /** IANA time zone (e.g. "Australia/Sydney"). Daylight saving follows the
+   *  zone's rules via the runtime's built-in Intl data; every window below is
+   *  local WALL-CLOCK time, so the free window tracks a DST change. */
+  timeZone: string;
   /** Free grid window, minutes since local midnight. Start is on a half hour
    *  (the reserve forecast works in half-hour slots). */
   windowStartMins: number;
@@ -34,7 +36,7 @@ export interface Site {
 }
 
 export interface SiteVars {
-  UTC_OFFSET?: unknown; // "+10:00"
+  TIME_ZONE?: unknown; // "Australia/Brisbane"
   FREE_WINDOW_START?: unknown; // "11:00"
   FREE_WINDOW_END?: unknown; // "14:00"
   DAY_START?: unknown; // "05:30"
@@ -72,16 +74,19 @@ export function siteFromEnv(env: SiteVars): Site {
     if (!Number.isFinite(n) || n <= 0) throw new Error(`var ${k}="${v}" must be a positive number`);
     return n;
   };
-  const offset = (k: keyof SiteVars): number => {
+  const zone = (k: keyof SiteVars): string => {
     const v = raw(k);
-    if (!v) return NaN;
-    const m = /^([+-])(\d{2}):(\d{2})$/.exec(v);
-    if (!m || Number(m[2]) > 14 || Number(m[3]) > 59) throw new Error(`var ${k}="${v}" must be ±HH:MM`);
-    return (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+    if (!v) return "";
+    try {
+      formatter(v);
+    } catch {
+      throw new Error(`var ${k}="${v}" must be an IANA time zone, e.g. Australia/Sydney`);
+    }
+    return v;
   };
 
   const site: Site = {
-    tzOffsetMins: offset("UTC_OFFSET"),
+    timeZone: zone("TIME_ZONE"),
     windowStartMins: hhmm("FREE_WINDOW_START"),
     windowEndMins: hhmm("FREE_WINDOW_END"),
     dayStartMins: hhmm("DAY_START"),
@@ -111,19 +116,66 @@ export function siteFromEnv(env: SiteVars): Site {
   return site;
 }
 
+const formatters = new Map<string, Intl.DateTimeFormat>();
+function formatter(timeZone: string): Intl.DateTimeFormat {
+  let f = formatters.get(timeZone);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    formatters.set(timeZone, f);
+  }
+  return f;
+}
+
+/** The zone's offset from UTC, in minutes, at instant `ms` (DST-aware). */
+export function utcOffsetMins(site: Pick<Site, "timeZone">, ms: number): number {
+  const p: Record<string, number> = {};
+  for (const part of formatter(site.timeZone).formatToParts(new Date(ms))) p[part.type] = Number(part.value);
+  const wall = Date.UTC(p.year!, p.month! - 1, p.day!, p.hour!, p.minute!, p.second!);
+  return Math.round((wall - Math.floor(ms / 1000) * 1000) / 60_000);
+}
+
 /** Local wall-clock time as a Date whose UTC fields read as local time. */
-export function localNow(site: Pick<Site, "tzOffsetMins">, now = new Date()): Date {
-  return new Date(now.getTime() + site.tzOffsetMins * 60_000);
+export function localNow(site: Pick<Site, "timeZone">, now = new Date()): Date {
+  return new Date(now.getTime() + utcOffsetMins(site, now.getTime()) * 60_000);
 }
 
-/** UTC epoch ms of local midnight starting `date` (YYYY-MM-DD, local). */
-export function localMidnightMs(site: Pick<Site, "tzOffsetMins">, date: string): number {
-  return Date.parse(`${date}T00:00:00Z`) - site.tzOffsetMins * 60_000;
+/** Local half-hour slot (0..47, wall clock) containing instant `ms`. In the
+ *  repeated hour after DST ends two instants share a slot; in the hour
+ *  skipped when DST starts, those slots simply don't occur. */
+export function localSlot(site: Pick<Site, "timeZone">, ms: number): number {
+  const local = localNow(site, new Date(ms));
+  return local.getUTCHours() * 2 + (local.getUTCMinutes() >= 30 ? 1 : 0);
 }
 
-/** "+1000" / "-0330" — the offset suffix FoxESS puts on sample times. */
-export function offsetSuffix(site: Pick<Site, "tzOffsetMins">): string {
-  const m = Math.abs(site.tzOffsetMins);
+/** UTC epoch ms of local midnight starting `date` (YYYY-MM-DD, local). A
+ *  local day is 23 or 25 hours long when DST starts or ends: measure it as
+ *  localMidnightMs(next day) - localMidnightMs(date), never as 24 h. */
+export function localMidnightMs(site: Pick<Site, "timeZone">, date: string): number {
+  const wall = Date.parse(`${date}T00:00:00Z`);
+  // Offset at the guess, then once more at the corrected instant: converges
+  // unless a transition sits within hours of midnight (not in Australia,
+  // whose changes happen at 02:00/03:00).
+  const guess = wall - utcOffsetMins(site, wall) * 60_000;
+  return wall - utcOffsetMins(site, guess) * 60_000;
+}
+
+/** YYYY-MM-DD plus `n` calendar days. */
+export function addDays(date: string, n: number): string {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** "+1000" / "-0330" — the offset suffix format FoxESS puts on sample times. */
+export function offsetSuffix(offsetMins: number): string {
+  const m = Math.abs(offsetMins);
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${site.tzOffsetMins < 0 ? "-" : "+"}${pad(Math.floor(m / 60))}${pad(m % 60)}`;
+  return `${offsetMins < 0 ? "-" : "+"}${pad(Math.floor(m / 60))}${pad(m % 60)}`;
 }

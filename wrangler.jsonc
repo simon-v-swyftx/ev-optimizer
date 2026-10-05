@@ -23,9 +23,10 @@
   // (and alerts) if one is missing or malformed. The values below are an
   // example install — change every one to match yours.
   "vars": {
-    // Fixed offset from UTC, ±HH:MM. NO daylight saving support: if your
-    // region observes DST this design does not fit as-is (see SPEC.md).
-    "UTC_OFFSET": "+10:00",
+    // IANA time zone of the site. Daylight saving is followed automatically:
+    // every time below is local wall-clock time, so e.g. Australia/Sydney
+    // keeps the free window at 11:00 local in both AEST and AEDT.
+    "TIME_ZONE": "Australia/Brisbane",
     // Free (or cheap) grid window, local time. Start must be on :00 or :30.
     "FREE_WINDOW_START": "11:00",
     "FREE_WINDOW_END": "14:00",

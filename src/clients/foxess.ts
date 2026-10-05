@@ -10,7 +10,7 @@
  * (both sources hash Python raw strings). Path only: no host, query, or body.
  * Envelope: { errno, msg?, result } with errno === 0 on success.
  */
-import { localMidnightMs, offsetSuffix, type Site } from "../site";
+import { addDays, localMidnightMs, offsetSuffix, utcOffsetMins, type Site } from "../site";
 
 export class FoxEssClient {
   constructor(
@@ -129,29 +129,36 @@ export class FoxEssClient {
   /** One local day (YYYY-MM-DD) of loadsPower samples as half-hour kWh. */
   async pullDailyLoadHistory(
     date: string,
-    site: Pick<Site, "tzOffsetMins">,
+    site: Pick<Site, "timeZone">,
   ): Promise<{ slot: number; loadKwh: number }[]> {
     const begin = localMidnightMs(site, date);
-    const suffix = offsetSuffix(site);
+    const dayEnd = localMidnightMs(site, addDays(date, 1));
     const result = await this.post<
       { datas: { variable: string; data: { time: string; value: number }[] }[] }[]
     >("/op/v0/device/history/query", {
       sn: this.deviceSn,
       variables: ["loadsPower"],
       begin,
-      end: begin + 24 * 60 * 60 * 1000 - 1, // query span must stay <= 24 h
+      // Query span must stay <= 24 h: the 25-h day DST ends on loses its
+      // last hour of samples (those slots just average over fewer days).
+      end: Math.min(dayEnd, begin + 24 * 60 * 60 * 1000) - 1,
     });
     const samples = result[0]?.datas.find((d) => d.variable === "loadsPower")?.data ?? [];
 
     const bySlot = new Map<number, { sum: number; n: number }>();
     for (const s of samples) {
       // time is inverter-local, e.g. "2025-11-25 17:58:16 CST+0800". Slot
-      // arithmetic below assumes the device timezone is UTC_OFFSET; a wrong
-      // cloud-side timezone would silently phase-shift every slot, so fail
-      // loud instead (the nightly caller alerts on any throw).
-      if (!s.time.endsWith(suffix)) {
+      // arithmetic below assumes the device clock is TIME_ZONE wall time
+      // (including its DST changes); a wrong cloud-side timezone would
+      // silently phase-shift every slot, so fail loud instead (the nightly
+      // caller alerts on any throw).
+      const off = /([+-])(\d{2})(\d{2})$/.exec(s.time);
+      const offMins = off ? (off[1] === "-" ? -1 : 1) * (Number(off[2]) * 60 + Number(off[3])) : NaN;
+      const wall = Date.parse(`${s.time.slice(0, 10)}T${s.time.slice(11, 19)}Z`);
+      const want = utcOffsetMins(site, wall - offMins * 60_000);
+      if (!Number.isFinite(wall) || offMins !== want) {
         throw new Error(
-          `FoxESS sample time not UTC${suffix} (${s.time}); fix the device timezone in FoxESS cloud or UTC_OFFSET`,
+          `FoxESS sample time not UTC${offsetSuffix(want)} (${s.time}); fix the device timezone in FoxESS cloud or TIME_ZONE`,
         );
       }
       // the API can over-run into the next day; keep only the requested date

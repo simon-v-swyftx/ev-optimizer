@@ -64,6 +64,33 @@ describe("excludedSlots", () => {
 
 const HOME_XY = { lat: HOME.lat, lon: HOME.lon };
 
+describe("excludedSlots across DST (Australia/Sydney)", () => {
+  const SYD_SITE = { ...TEST_SITE, timeZone: "Australia/Sydney" };
+
+  it("uses wall-clock slots after DST starts (11:00 AEDT = slot 22)", () => {
+    // 2026-10-04 is the 23-h day: 02:00 AEST jumps to 03:00 AEDT.
+    const charges = [
+      {
+        startedAtMs: Date.parse("2026-10-04T11:00:00+11:00"),
+        endedAtMs: Date.parse("2026-10-04T12:00:00+11:00"),
+        ...HOME_XY,
+      },
+    ];
+    expect([...excludedSlots(charges, HOME, "2026-10-04", 0, SYD_SITE)].sort()).toEqual([22, 23]);
+  });
+
+  it("covers the late-evening slots of the 25-h day DST ends on", () => {
+    const charges = [
+      {
+        startedAtMs: Date.parse("2026-04-05T23:00:00+10:00"),
+        endedAtMs: Date.parse("2026-04-06T01:00:00+10:00"),
+        ...HOME_XY,
+      },
+    ];
+    expect([...excludedSlots(charges, HOME, "2026-04-05", 0, SYD_SITE)].sort()).toEqual([46, 47]);
+  });
+});
+
 describe("haversineM", () => {
   it("zero distance to itself, ~111 km per degree of latitude", () => {
     expect(haversineM(HOME.lat, HOME.lon, HOME.lat, HOME.lon)).toBe(0);
