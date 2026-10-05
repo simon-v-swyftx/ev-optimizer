@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
+import { DEFAULT_SAFETY_FACTOR } from "./constants";
 import { reservePct } from "./reserve";
+import { TEST_SITE } from "./testing";
 
-const base = { safetyFactor: 1.3, batteryKwh: 42 };
+// Reference site: 42 kWh, 10% BMS minimum, window at 11:00 (slot 22). The
+// expected numbers below are worked out for it at the default safety factor.
+const base = {
+  safetyFactor: DEFAULT_SAFETY_FACTOR,
+  batteryKwh: TEST_SITE.batteryKwh,
+  minSocPct: TEST_SITE.batteryMinSocPct,
+  windowStartSlot: TEST_SITE.windowStartMins / 30,
+};
 
 describe("reservePct", () => {
   it("adds the forecast on top of a raised floor; below-minimum floors count as 10", () => {

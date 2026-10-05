@@ -1,5 +1,10 @@
+# Local secrets for `pnpm run dev` (copy to .dev.vars, which is gitignored).
+# Production uses `wrangler secret put <NAME>` for each of these.
 TESSIE_TOKEN=
 TESSIE_VIN=
 FOXESS_API_KEY=
 FOXESS_DEVICE_SN=
+# Pick an unguessable topic: anyone who knows it can read your alerts.
 NTFY_TOPIC=
+# Bearer token for the admin routes (/backfill, /status, /car/*, /debug/foxess).
+ADMIN_KEY=

@@ -1,15 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { decide, type Action, type DecideInputs, type StoredState } from "./tick";
+import { DEFAULT_SAFETY_FACTOR, DEFAULT_STRANDED_MIN_PCT } from "./constants";
+import { TEST_SITE } from "./testing";
 
-/** 06:00 Brisbane, car plugged in at home below limit, battery above reserve,
+/** 06:00 local, car plugged in at home below limit, battery above reserve,
  *  no sun, fresh day (stored = null -> PLAN runs). */
 function base(): DecideInputs {
   return {
     date: "2026-07-06",
     nowMins: 6 * 60,
+    site: TEST_SITE,
     car: { pluggedIn: true, chargingState: "Stopped", socPct: 50, limitPct: 80, chargeAmps: 16, atHome: true },
     house: { socPct: 44, loadW: 400, gridImportW: 0, pvW: 0, feedinW: 0 },
-    cfg: { safetyFactor: 1.3, strandedMinPct: 30, solarTrack: true, solarSoak: true, shadowMode: false },
+    cfg: { safetyFactor: DEFAULT_SAFETY_FACTOR, strandedMinPct: DEFAULT_STRANDED_MIN_PCT, solarTrack: true, solarSoak: true, shadowMode: false },
     samples: [],
     floorPct: 10,
     stored: null,

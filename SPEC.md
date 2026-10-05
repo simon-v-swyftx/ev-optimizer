@@ -1,10 +1,22 @@
 # Design specification
 
+Numbers and clock times in this document describe the **reference install**
+the design was developed on (see "Reference install"). On your install they
+come from the site vars in `wrangler.jsonc` (`UTC_OFFSET`,
+`FREE_WINDOW_START`/`END`, `DAY_START`, `SOLAR_SOAK_END`, `BATTERY_KWH`,
+`BATTERY_MIN_SOC`, charger volts/phases/amps, `HOME_RADIUS_M`) — read
+"11:00" as "free-window start", "14:00" as "free-window end", "05:30" as
+`DAY_START`, "42 kWh" as `BATTERY_KWH`, "10% BMS minimum" as
+`BATTERY_MIN_SOC`, "16 A" as `CHARGER_MAX_AMPS`, and so on. The 8 kW
+floor-hit import trigger and 4.5 kW solar-resume surplus scale with the
+charger (72.5% of max draw; minimum draw + 1.05 kW). "The owner" is
+whoever runs the install. Dated notes are the design's decision log.
+
 ## Problem
 
-Owner has a 42 kWh FoxESS battery + 15 kW hybrid inverter and a Tesla MY LR
-(11 kW three-phase AC charging). Grid power is free 11:00–14:00 AEST every
-day. The owner usually drives to work and cannot charge the car during the
+The reference install has a 42 kWh FoxESS battery + 15 kW hybrid inverter
+and a Tesla Model Y LR (11 kW three-phase AC charging). Grid power is free
+11:00–14:00 local time every day, but the car is usually away during the
 free window. Goal: each morning, transfer surplus home-battery energy into
 the car before departure, while guaranteeing the house has enough battery to
 reach 11:00, at which point the battery refills to 100% for free. If the car
@@ -21,13 +33,13 @@ house reserve. There is no marginal-cost optimisation to do pre-window.
 During the window there is no contention: the car's 11 kW comes from the
 grid directly, the battery force-charges in parallel through the inverter.
 
-The owner's evening export (18:00–21:00, see "Owner operating facts") does
+The reference install's evening export (18:00–21:00, see "Reference install") does
 not change this: it sells energy from the same free 11:00–14:00 refill, so a
 morning dump never competes with export revenue.
 
 ## Control strategy
 
-No attempt to predict "is the owner going to work today". The system reacts:
+No attempt to predict "is the car leaving today". The system reacts:
 charge whenever (plugged in at HOME ∧ car SoC < car's charge limit ∧ battery
 above reserve). Unplugging ends the session naturally. Same logic works
 weekends and holidays with zero calendar awareness.
@@ -59,7 +71,7 @@ interfering"). The Tesla app start button is the escape hatch; no pause
 endpoint. Raising the car's charge limit is the "big drive tomorrow" knob.
 Session ownership is tracked in `sessions` (step 4 adds started_by).
 
-## State machine (ticks every 5 min, 05:30–17:45 Brisbane)
+## State machine (ticks every 5 min, 05:30–17:45 local)
 
 States: IDLE ⇄ DUMPING ⇄ SOLAR_TRACK → FREE_WINDOW → SOLAR_SOAK → DONE. PLAN is the
 first-tick-of-day event (creates the day's stored state), not a state.
@@ -307,9 +319,9 @@ default (trades overnight house autonomy for car charge).
   SOLAR_TRACK adds pvPower + feedinPower to the SAME call — no extra
   API-budget cost; presence confirmed live 2026-07-06. History = POST /op/v0/device/history/query,
   begin/end in ms, span ≤ 24 h; sample times are inverter-LOCAL strings
-  ("2026-07-03 00:02:33 AEST+1000") at ~5-min cadence, may over-run the
-  requested day, values may be null. The client fails loud if timestamps are
-  not +1000 — a wrong cloud-side device timezone would otherwise silently
+  ("2026-07-03 00:02:33 AEST+1000" on a UTC+10 install) at ~5-min cadence, may over-run the
+  requested day, values may be null. The client fails loud if timestamps
+  don't carry the configured UTC_OFFSET — a wrong cloud-side device timezone would otherwise silently
   phase-shift every slot.
 - Error codes: 40256 bad headers/signature, 40257 bad body, 40400 rate
   limit, 44096 "cannot update settings when schedule is active" — any future
@@ -327,14 +339,15 @@ default (trades overnight house autonomy for car charge).
                 reserve is dropped: the reserve now sits on top of it)
   The owner may manually skip the evening export before a long drive; that
   stays a manual FoxESS-app action (no calendar awareness).
-- Nightly job (LIVE since 2026-07-04, cron 0 15 * * * UTC = 01:00 Brisbane):
+- Nightly job (LIVE since 2026-07-04; 01:00 local, run from the 5-min cron so
+  no cron edit is needed for a different UTC_OFFSET):
   pull yesterday's loadsPower into half-hour `load_samples`.
   NOTE: loadsPower INCLUDES the EV charger (verified: the owner's manual
   midnight charge showed as ~10 kW in slot 0 on 2026-07-03). Charge
   exclusion happens AT INGEST (2026-07-05, src/charges.ts): both the
   nightly pull and the backfill fetch Tessie charge history and DROP any
   half-hour slot overlapping a home charge session before insert. Tessie
-  history sees ALL charges — including the owner's midnight habit, which
+  history sees ALL charges — including manual off-hours charges, which
   happens outside the tick window and is therefore invisible to the
   sessions table; the earlier plan to filter via recorded sessions is
   superseded. Unknown charge location counts as home (wrongly excluding a
@@ -385,21 +398,23 @@ default (trades overnight house autonomy for car charge).
   never stopped. The owner's app schedule has an END time too (owner-
   confirmed 2026-07-05: the Tesla app supports charge windows), so the
   dead-controller backstop is bounded at 14:00 — no paid overrun.
-- The account has TWO vehicles; the TESSIE_VIN secret selects "VICTORY".
-  Token + VIN verified live 2026-07-04: cached /{vin}/state returned
+- A Tessie account may hold several vehicles; the TESSIE_VIN secret selects
+  the one to control. Token + VIN verified live 2026-07-04: cached /{vin}/state returned
   battery_level, charge_limit_soc, charging_state, charge_port_latch and
   charge_amps without waking the car.
 
-## Owner operating facts (confirmed 2026-07-04)
+## Reference install (confirmed 2026-07-04)
 
-- Leaves for work 07:00–08:00 → the dump must effectively finish by ~07:00
-  (it does: ~11 kWh surplus at 11 kW ≈ 1 h from a 05:30 start).
+The facts the reference install's tuning was derived from. Yours will
+differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
+
+- The car usually leaves 07:00–08:00 → the dump must effectively finish by
+  ~07:00 (it does: ~11 kWh surplus at 11 kW ≈ 1 h from a 05:30 start).
 - House load is flat, ~0.4 kW baseline; 05:30→11:00 ≈ 2.2 kWh, so
   reserve_pct ≈ 17% with the 1.3 safety factor.
 - Typical day: ~50% SoC at 21:00 (post-export), ~2.4 kWh overnight load,
   ~44% at 05:30, ~11 kWh dumpable → ~9–10 kWh (~60 km) into the car, free.
-- Owner sometimes charges the car manually at odd hours (e.g. midnight, to
-  sleep in) — both the manual-override rule and the ingest-time charge
+- The car is sometimes charged manually at odd hours (e.g. midnight) — both the manual-override rule and the ingest-time charge
   exclusion exist because of this.
 - Feed-in pays well only on the first 15 kWh/day → the 18:00–21:00 export is
   deliberately ~15 kWh, duration-tuned by the owner, no fdSoC floor.
@@ -408,7 +423,7 @@ default (trades overnight house autonomy for car charge).
   alone can almost never cover house load + the car's 3.45 kW minimum,
   especially before 11:00 (east panels only) — see the SOLAR_TRACK note.
 - Home geofence centre: kept out of the repo — seed the D1 config keys
-  home_lat/home_lon at go-live (owner-supplied 2026-07-05).
+  home_lat/home_lon at go-live (README "Setup").
 
 ## Data model (D1)
 

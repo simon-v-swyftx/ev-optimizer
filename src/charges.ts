@@ -1,10 +1,10 @@
 /**
- * Tessie charge history → Brisbane half-hour slots to exclude from
+ * Tessie charge history → local half-hour slots to exclude from
  * load_samples (loadsPower includes the EV charger; see SPEC "Nightly job").
  * Pure functions — keep them exhaustively testable.
  */
 
-import { HOME_RADIUS_M } from "./constants";
+import { localMidnightMs, type Site } from "./site";
 
 const SLOT_MS = 30 * 60 * 1000;
 
@@ -24,7 +24,7 @@ export function haversineM(lat1: number, lon1: number, lat2: number, lon2: numbe
 }
 
 /**
- * Slots of `date` (YYYY-MM-DD Brisbane) that overlap a home charging session.
+ * Slots of `date` (YYYY-MM-DD local) that overlap a home charging session.
  * A charge with unknown location counts as home: wrongly excluding a slot
  * only pushes the forecast toward its conservative 1.0 kW bootstrap, while
  * wrongly keeping one bakes ~10 kW of charger into the house forecast.
@@ -34,14 +34,15 @@ export function excludedSlots(
   home: { lat: number; lon: number },
   date: string,
   nowMs: number,
+  site: Pick<Site, "tzOffsetMins" | "homeRadiusM">,
 ): Set<number> {
-  const dayStart = Date.parse(`${date}T00:00:00+10:00`);
+  const dayStart = localMidnightMs(site, date);
   const out = new Set<number>();
   for (const c of charges) {
     if (
       c.lat !== null &&
       c.lon !== null &&
-      haversineM(c.lat, c.lon, home.lat, home.lon) > HOME_RADIUS_M
+      haversineM(c.lat, c.lon, home.lat, home.lon) > site.homeRadiusM
     ) {
       continue; // away charge: no effect on house loadsPower
     }

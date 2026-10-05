@@ -5,45 +5,55 @@ import { excludedSlots, haversineM } from "./charges";
 import {
   DEFAULT_SAFETY_FACTOR,
   DEFAULT_STRANDED_MIN_PCT,
-  HOME_RADIUS_M,
   LOAD_LOOKBACK_DAYS,
-  TICK_END_MINS,
-  TICK_START_MINS,
-  TZ_OFFSET_MS,
+  NIGHTLY_PULL_MINS,
+  TICK_TAIL_MINS,
 } from "./constants";
+import { localMidnightMs, localNow, siteFromEnv, type Site, type SiteVars } from "./site";
 
-export interface Env {
+export interface Env extends SiteVars {
   DB: D1Database;
   TESSIE_TOKEN: string;
   TESSIE_VIN: string;
   FOXESS_API_KEY: string;
   FOXESS_DEVICE_SN: string;
   NTFY_TOPIC: string;
+  NTFY_URL?: string; // ntfy server, default https://ntfy.sh (self-hosters override)
   ADMIN_KEY: string; // bearer for admin HTTP routes (/backfill, step-3 endpoints)
 }
 
-// Local time is a fixed UTC offset, no DST (invariant 5). Do not add
-// timezone libraries.
-export function brisbaneNow(now = new Date()): Date {
-  return new Date(now.getTime() + TZ_OFFSET_MS);
-}
+// Local time is a fixed UTC offset (UTC_OFFSET var), no DST (invariant 5).
+// Do not add timezone libraries.
+const localMins = (local: Date) => local.getUTCHours() * 60 + local.getUTCMinutes();
 
-function withinOperatingWindow(local: Date): boolean {
-  const mins = local.getUTCHours() * 60 + local.getUTCMinutes();
-  return mins >= TICK_START_MINS && mins <= TICK_END_MINS;
+function withinOperatingWindow(local: Date, site: Site): boolean {
+  const mins = localMins(local);
+  return mins >= site.dayStartMins && mins <= site.soakEndMins + TICK_TAIL_MINS;
 }
-
-const NIGHTLY_CRON = "0 15 * * *"; // 01:00 Brisbane
 
 export default {
-  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
-    const local = brisbaneNow();
+  // One 5-min cron drives everything; local-time gating lives here so the
+  // cron never needs editing when the timezone or windows change.
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    let site: Site;
+    try {
+      site = siteFromEnv(env);
+    } catch (err) {
+      console.error("bad site config", err);
+      // Alert once an hour, not every tick: the fix is a redeploy anyway.
+      if (new Date().getUTCMinutes() < 5) {
+        ctx.waitUntil(notify(env, `config error, controller idle: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      return;
+    }
+    const local = localNow(site);
+    const mins = localMins(local);
     const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
     const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
 
-    if (event.cron === NIGHTLY_CRON) {
+    if (mins >= NIGHTLY_PULL_MINS && mins < NIGHTLY_PULL_MINS + 5) {
       ctx.waitUntil(
-        pullYesterdayLoad(env, foxess, tessie, local).catch(async (err) => {
+        pullYesterdayLoad(env, site, foxess, tessie, local).catch(async (err) => {
           console.error("nightly load pull failed", err); // survives even if ntfy is down
           await notify(env, `nightly load pull failed: ${err instanceof Error ? err.message : String(err)}`);
         }),
@@ -51,10 +61,10 @@ export default {
       return;
     }
 
-    if (!withinOperatingWindow(local)) return;
+    if (!withinOperatingWindow(local, site)) return;
 
     ctx.waitUntil(
-      runTick(env, foxess, tessie, local).catch(async (err) => {
+      runTick(env, site, foxess, tessie, local).catch(async (err) => {
         console.error("tick failed", err); // survives even if ntfy is down
         await notify(env, `tick failed: ${err instanceof Error ? err.message : String(err)}`);
       }),
@@ -80,19 +90,20 @@ export default {
       if ((Date.parse(to) - Date.parse(from)) / 86_400_000 >= 21) {
         return new Response("max 21 days per call", { status: 400 });
       }
+      const site = siteFromEnv(env);
       const foxess = new FoxEssClient(env.FOXESS_API_KEY, env.FOXESS_DEVICE_SN);
       const tessie = new TessieClient(env.TESSIE_TOKEN, env.TESSIE_VIN);
       // One charges call for the whole range (padded a day each side for
       // midnight-spanning sessions) keeps the request under subrequest limits.
       const home = await homeCoords(env);
-      const fromMs = Date.parse(`${from}T00:00:00+10:00`);
-      const toMs = Date.parse(`${to}T00:00:00+10:00`);
+      const fromMs = localMidnightMs(site, from);
+      const toMs = localMidnightMs(site, to);
       const charges = await tessie.getCharges((fromMs - 86_400_000) / 1000, (toMs + 2 * 86_400_000) / 1000);
       const ok: string[] = [];
       const failed: Record<string, string> = {};
       for (let d = from; d <= to; d = nextDay(d)) {
         try {
-          await pullDayLoad(env, foxess, d, excludedSlots(charges, home, d, Date.now()));
+          await pullDayLoad(env, site, foxess, d, excludedSlots(charges, home, d, Date.now(), site));
           ok.push(d);
         } catch (err) {
           failed[d] = err instanceof Error ? err.message : String(err);
@@ -153,12 +164,13 @@ export default {
  *  shadow mode), persist state + decision log. */
 export async function runTick(
   env: Env,
+  site: Site,
   foxess: FoxEssClient,
   tessie: TessieClient,
   local: Date,
 ): Promise<void> {
   const date = local.toISOString().slice(0, 10);
-  const nowMins = local.getUTCHours() * 60 + local.getUTCMinutes();
+  const nowMins = localMins(local);
 
   const cfgRows = await d1Retry(() =>
     env.DB.prepare("SELECT key, value FROM config").all<{ key: string; value: string }>(),
@@ -196,7 +208,7 @@ export async function runTick(
       ).results;
 
   const atHome =
-    car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= HOME_RADIUS_M;
+    car.latLon !== null && haversineM(car.latLon.lat, car.latLon.lon, home.lat, home.lon) <= site.homeRadiusM;
 
   // PLAN-time read-only hardware-floor read, BEFORE decide: the house's
   // forecast energy is reserved on top of minSocOnGrid. Only the FoxESS
@@ -218,12 +230,13 @@ export async function runTick(
   const inputs: DecideInputs = {
     date,
     nowMins,
+    site,
     car: {
       pluggedIn: car.pluggedIn,
       chargingState: car.chargingState,
       socPct: car.socPct,
       limitPct: car.limitPct,
-      chargeAmps: car.chargeAmps,
+      chargeAmps: car.chargeAmps ?? site.maxAmps,
       atHome,
     },
     house,
@@ -285,7 +298,7 @@ export async function runTick(
   if (!stored && floorReadErr !== undefined) {
     const msg = floorReadErr instanceof Error ? floorReadErr.message : String(floorReadErr);
     if (!shadowMode) {
-      await notify(env, `reserve floor read failed (assuming 10%): ${msg}`);
+      await notify(env, `reserve floor read failed (assuming ${site.batteryMinSocPct}%): ${msg}`);
     } else {
       console.error("floor read failed (shadow)", floorReadErr);
     }
@@ -326,32 +339,34 @@ async function recordReadFailure(env: Env, err: unknown): Promise<void> {
   }
 }
 
-/** Pull yesterday's (Brisbane) load history into load_samples, dropping
+/** Pull yesterday's (local) load history into load_samples, dropping
  *  slots that overlap a home charging session (Tessie charge history sees
  *  ALL charges, including outside the tick window — the sessions table
  *  cannot). Fails loud: a day with unfilterable EV load must not enter the
  *  forecast. */
 export async function pullYesterdayLoad(
   env: Env,
+  site: Site,
   foxess: FoxEssClient,
   tessie: TessieClient,
   local: Date,
 ): Promise<void> {
   const date = new Date(local.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const home = await homeCoords(env);
-  const dayMs = Date.parse(`${date}T00:00:00+10:00`);
+  const dayMs = localMidnightMs(site, date);
   const charges = await tessie.getCharges((dayMs - 86_400_000) / 1000, (dayMs + 2 * 86_400_000) / 1000);
-  await pullDayLoad(env, foxess, date, excludedSlots(charges, home, date, Date.now()));
+  await pullDayLoad(env, site, foxess, date, excludedSlots(charges, home, date, Date.now(), site));
 }
 
-/** Pull one Brisbane day (YYYY-MM-DD) of load history into load_samples. */
+/** Pull one local day (YYYY-MM-DD) of load history into load_samples. */
 export async function pullDayLoad(
   env: Env,
+  site: Site,
   foxess: FoxEssClient,
   date: string,
   exclude: Set<number>,
 ): Promise<void> {
-  const rows = await foxess.pullDailyLoadHistory(date);
+  const rows = await foxess.pullDailyLoadHistory(date, site);
   if (rows.length === 0) throw new Error(`no load samples returned for ${date}`);
   const kept = rows.filter((r) => !exclude.has(r.slot));
   const stmt = env.DB.prepare(
@@ -377,7 +392,7 @@ async function homeCoords(env: Env): Promise<{ lat: number; lon: number }> {
   const lat = map.get("home_lat");
   const lon = map.get("home_lon");
   if (lat === undefined || lon === undefined || Number.isNaN(lat) || Number.isNaN(lon)) {
-    throw new Error("config home_lat/home_lon missing (seed per SPEC 'Owner operating facts')");
+    throw new Error("config home_lat/home_lon missing (seed them per README 'Setup')");
   }
   return { lat, lon };
 }
@@ -418,7 +433,8 @@ export async function notify(env: Env, message: string, delaysMs = [0, 500, 1500
     if (wait) await new Promise((r) => setTimeout(r, wait));
     let res: Response;
     try {
-      res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, { method: "POST", body: message });
+      const server = (env.NTFY_URL || "https://ntfy.sh").replace(/\/+$/, "");
+      res = await fetch(`${server}/${env.NTFY_TOPIC}`, { method: "POST", body: message });
     } catch (err) {
       lastErr = err; // network-level failure (DNS/TLS/reset) — transient, retry
       continue;
