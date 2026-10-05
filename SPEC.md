@@ -411,8 +411,8 @@ SOLAR_SOAK (14:00–17:30; added 2026-09-27)
 
 DONE (post 17:30, or 14:00 with solar_soak off). An EVENING_DUMP (same as
 DUMPING with the reserve horizon = house load until 11:00 TOMORROW) was
-sketched here but never built; the evening_dump config row went with
-migration 0004. On the reference install the morning dump already moves
+sketched here but never built; its evening_dump config row is removed by
+the schema migration. On the reference install the morning dump already moves
 more than the overnight surplus before departure, so it buys nothing.
 
 ## FoxESS integration
@@ -611,6 +611,14 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
 
 ## Data model (D1)
 
+Schema: migrations/0001_schema.sql, one idempotent file (collapsed on
+2026-10-05 from four per-step migrations before the repo went public).
+wrangler applies local migration names it has not recorded and ignores
+recorded names no longer on disk, so a database built by the old files
+simply applies the new one once: every CREATE is IF NOT EXISTS, config
+defaults are INSERT OR IGNORE, and only the never-used leftovers (the
+sessions table, three unread config rows) are removed.
+
 - config(key TEXT PK, value TEXT) — reserve safety factor, stranded_min,
   solar_track flag (default on), glide_mode (asap |
   continuous, default asap), solar_soak flag (default on), soak_export
@@ -618,10 +626,10 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
   (default ON — commands only sent when explicitly 'false'), home_lat/
   home_lon (geofence), home_detection (gps | bluetooth | gps_or_bluetooth
   | gps_and_bluetooth, default gps). The evening_dump and operating-window
-  rows 0001 seeded were never read (the window comes from wrangler vars);
-  migration 0004 deletes them.
+  rows an early migration seeded were never read (the window comes from
+  wrangler vars); the schema migration deletes them.
 - presence(id = 1, home INT, reported_at TEXT, source TEXT) — latest
-  bluetooth / webhook car-presence report (migration 0003)
+  bluetooth / webhook car-presence report
 - days(date TEXT PK, reserve_pct INT, planned_at TEXT, state TEXT)
 - decisions(id, ts, state_from, state_to, action, inputs_json) — every tick
   that does anything writes a row
@@ -629,7 +637,7 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
 - (sessions — created by 0001 for per-session bookkeeping, never written:
   ownership lives in days.state_json, the audit trail in decisions, and
   forecast hygiene happens at ingest from the car API's charge history.
-  Dropped by migration 0004.)
+  Dropped by the schema migration.)
 
 ## Failure modes → behaviour
 
@@ -695,11 +703,11 @@ differ: set the site vars in `wrangler.jsonc` and revisit src/constants.ts.
    stand-down (owner stopping a SYSTEM session via the app blocks
    auto-starts until the free window, one alert; owner stopping their OWN
    session hands control back). Forecast charge-exclusion ships at ingest
-   (src/charges.ts). Persisted state = days.state_json (migration 0002).
+   (src/charges.ts). Persisted state = days.state_json.
    PLAN forecast uses all days of the last 14 (spec offered 5-weekday or
    all-days; all-days chosen — owner's load is flat). Sessions-table
    bookkeeping dropped: ownership lives in state_json, audit in decisions;
-   the empty table was dropped by migration 0004 (2026-10-05).
+   the empty table was dropped on 2026-10-05.
 5. ✅ DONE 2026-07-05 — */5 cron live, gated 05:30–14:15 in code (extended
    to 17:45 on 2026-09-27 for SOLAR_SOAK). SHADOW
    MODE ON (config shadow_mode, default true — commands sent only when

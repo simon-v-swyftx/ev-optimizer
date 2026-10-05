@@ -84,7 +84,8 @@ src/testing.ts):
   DAY_START..SOLAR_SOAK_END+15 min local for the tick, and 01:00 local for
   the nightly load pull. SHADOW MODE until config shadow_mode='false' — see
   SPEC step 5
-- State: D1 (SQLite) — see migrations/0001_init.sql
+- State: D1 (SQLite) — see migrations/0001_schema.sql, a single idempotent
+  migration (add new schema changes there, keeping it re-runnable)
 - Car: one provider behind src/clients/car.ts (`CarClient`), chosen by
   which token secret is set (both or neither = config error):
   - Tessie API (https://api.tessie.com, bearer token) — handles command
